@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>piper-chat</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #080a0e;
+      --surface: #0d1117;
+      --card: #161b22;
+      --border: #21262d;
+      --text: #e0e6ed;
+      --muted: #6e7681;
+      --accent: #00ff41;
+      --accent-dim: rgba(0, 255, 65, 0.10);
+      --own-bg: #0d3318;
+    }
+
+    body {
+      font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+      background: var(--bg);
+      color: var(--text);
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── header ── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-shrink: 0;
+    }
+
+    .header-left { display: flex; align-items: center; gap: 10px; }
+
+    .status-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      animation: pulse 2.5s ease-in-out infinite;
+    }
+
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+    h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.3px; }
+
+    .stats {
+      display: flex; gap: 18px;
+      font-size: 11px; color: var(--muted);
+    }
+
+    .stat-val { color: var(--accent); font-weight: 600; }
+
+    /* ── messages ── */
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .messages::-webkit-scrollbar { width: 6px; }
+    .messages::-webkit-scrollbar-track { background: var(--bg); }
+    .messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    .empty {
+      margin: auto;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 2;
+      padding: 40px;
+    }
+
+    .msg {
+      padding: 10px 14px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      animation: slide-in 0.2s ease-out;
+    }
+
+    @keyframes slide-in {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .msg.own {
+      background: var(--own-bg);
+      border-color: var(--accent);
+      border-left-width: 3px;
+    }
+
+    .msg-meta {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 5px;
+    }
+
+    .msg-author { color: var(--accent); font-size: 12px; font-weight: 600; }
+    .msg-time   { color: var(--muted);  font-size: 11px; }
+
+    .msg-text {
+      font-size: 13px;
+      line-height: 1.45;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+
+    /* ── input area ── */
+    .input-area {
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 14px 20px;
+      flex-shrink: 0;
+    }
+
+    .name-row {
+      display: none;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .name-row.visible { display: flex; }
+
+    .msg-row { display: flex; gap: 8px; }
+
+    input[type="text"] {
+      flex: 1;
+      padding: 10px 14px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 5px;
+      font: inherit;
+      font-size: 13px;
+      transition: border-color 0.15s;
+    }
+
+    input[type="text"]:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px var(--accent-dim);
+    }
+
+    input[type="text"]::placeholder { color: var(--muted); }
+
+    button {
+      padding: 10px 18px;
+      background: var(--accent);
+      color: var(--bg);
+      border: none;
+      border-radius: 5px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: opacity 0.15s, transform 0.1s;
+    }
+
+    button:hover { opacity: 0.85; transform: translateY(-1px); }
+    button:active { transform: translateY(0); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+    /* ── peer connect modal ── */
+    .modal-overlay {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.7);
+      z-index: 10;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .modal-overlay.visible { display: flex; }
+
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+      width: min(480px, 90vw);
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .modal h2 { font-size: 14px; font-weight: 600; }
+    .modal p { font-size: 12px; color: var(--muted); line-height: 1.5; }
+
+    .modal textarea {
+      width: 100%; height: 80px;
+      padding: 10px 12px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 5px;
+      font: inherit;
+      font-size: 11px;
+      resize: vertical;
+    }
+
+    .modal textarea:focus { outline: none; border-color: var(--accent); }
+
+    .modal-ticket {
+      font-size: 10px;
+      color: var(--muted);
+      word-break: break-all;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 10px;
+      line-height: 1.5;
+    }
+
+    .modal-btns { display: flex; gap: 8px; justify-content: flex-end; }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+
+    .btn-ghost:hover { background: var(--card); opacity: 1; }
+
+    @media (max-width: 600px) {
+      header { padding: 12px 14px; }
+      .messages { padding: 12px 14px; gap: 8px; }
+      .input-area { padding: 12px 14px; }
+      .stats { gap: 10px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <div class="status-dot"></div>
+    <h1>piper-chat</h1>
+  </div>
+  <div class="stats">
+    <span><span class="stat-val" id="stat-peers">0</span> peers</span>
+    <span><span class="stat-val" id="stat-msgs">0</span> msgs</span>
+    <span id="stat-mode" style="color:var(--muted)">relay</span>
+  </div>
+</header>
+
+<div class="messages" id="messages">
+  <div class="empty" id="empty">
+    the room is empty. invite a peer.<br>
+    <small style="font-size:11px">GET /ticket → share the string → POST /connect</small>
+  </div>
+</div>
+
+<div class="input-area">
+  <div class="name-row" id="name-row">
+    <input type="text" id="name-input" placeholder="choose a name" maxlength="24" autocomplete="off">
+    <button id="name-btn">set</button>
+  </div>
+  <div class="msg-row">
+    <input type="text" id="msg-input" placeholder="message" autocomplete="off" maxlength="4096">
+    <button id="send-btn">send</button>
+    <button id="peer-btn" style="background:var(--card);color:var(--text);border:1px solid var(--border)" title="connect a peer">⇄</button>
+  </div>
+</div>
+
+<!-- peer connect modal -->
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <h2>connect a peer</h2>
+    <p>share your ticket with another node, or paste theirs to sync documents directly via iroh P2P.</p>
+
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">your ticket</div>
+      <div class="modal-ticket" id="my-ticket">fetching…</div>
+      <button onclick="copyTicket()" style="margin-top:8px;font-size:11px;padding:6px 12px">copy ticket</button>
+    </div>
+
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">paste peer's ticket</div>
+      <textarea id="peer-ticket-input" placeholder="paste iroh ticket here…"></textarea>
+    </div>
+
+    <div class="modal-btns">
+      <button class="btn-ghost" onclick="closeModal()">cancel</button>
+      <button id="connect-btn" onclick="connectPeer()">connect</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  'use strict';
+
+  const STORAGE_KEY = 'piper-chat-name';
+  let myName = localStorage.getItem(STORAGE_KEY) || '';
+  let msgCount = 0;
+  let eventSource = null;
+  let myTicket = null;
+
+  // ── DOM refs ──────────────────────────────────────────────────────────────
+  const $msgs     = document.getElementById('messages');
+  const $empty    = document.getElementById('empty');
+  const $msgInput = document.getElementById('msg-input');
+  const $sendBtn  = document.getElementById('send-btn');
+  const $nameRow  = document.getElementById('name-row');
+  const $nameInput= document.getElementById('name-input');
+  const $nameBtn  = document.getElementById('name-btn');
+  const $peerBtn  = document.getElementById('peer-btn');
+  const $modal    = document.getElementById('modal');
+  const $myTicket = document.getElementById('my-ticket');
+  const $peerIn   = document.getElementById('peer-ticket-input');
+  const $peers    = document.getElementById('stat-peers');
+  const $statMsgs = document.getElementById('stat-msgs');
+  const $statMode = document.getElementById('stat-mode');
+
+  // ── name setup ────────────────────────────────────────────────────────────
+  if (!myName) {
+    $nameRow.classList.add('visible');
+    $nameInput.focus();
+  } else {
+    $msgInput.focus();
+  }
+
+  $nameBtn.addEventListener('click', saveName);
+  $nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') saveName(); });
+
+  function saveName() {
+    const v = $nameInput.value.trim().slice(0, 24);
+    if (!v) return;
+    myName = v;
+    localStorage.setItem(STORAGE_KEY, myName);
+    $nameRow.classList.remove('visible');
+    $msgInput.focus();
+  }
+
+  // ── send ──────────────────────────────────────────────────────────────────
+  $sendBtn.addEventListener('click', sendMsg);
+  $msgInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+  });
+
+  async function sendMsg() {
+    const text = $msgInput.value.trim();
+    if (!text || !myName) {
+      if (!myName) { $nameRow.classList.add('visible'); $nameInput.focus(); }
+      return;
+    }
+    $sendBtn.disabled = true;
+    try {
+      await fetch('/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: text, author: myName, channel: 'main' }),
+      });
+      $msgInput.value = '';
+      $msgInput.focus();
+    } catch (err) {
+      console.error('send failed:', err);
+    } finally {
+      $sendBtn.disabled = false;
+    }
+  }
+
+  // ── SSE ───────────────────────────────────────────────────────────────────
+  function connect() {
+    if (eventSource) eventSource.close();
+    eventSource = new EventSource('/events');
+    eventSource.onmessage = e => {
+      try { renderMsg(JSON.parse(e.data)); } catch (_) {}
+    };
+    eventSource.onerror = () => setTimeout(connect, 3000);
+  }
+
+  // ── render ────────────────────────────────────────────────────────────────
+  function renderMsg(msg) {
+    $empty.style.display = 'none';
+
+    const el = document.createElement('div');
+    el.className = 'msg' + (msg.author === myName ? ' own' : '');
+
+    const ts = new Date(msg.createdAt).toLocaleTimeString('en', {
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+
+    el.innerHTML =
+      `<div class="msg-meta">` +
+        `<span class="msg-author">${esc(msg.author)}</span>` +
+        `<span class="msg-time">${ts}</span>` +
+      `</div>` +
+      `<div class="msg-text"></div>`;
+
+    el.querySelector('.msg-text').textContent = msg.content;
+    $msgs.appendChild(el);
+    $msgs.scrollTop = $msgs.scrollHeight;
+
+    msgCount++;
+    $statMsgs.textContent = msgCount;
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // ── health poll ───────────────────────────────────────────────────────────
+  async function pollHealth() {
+    try {
+      const d = await (await fetch('/health')).json();
+      $peers.textContent = d.peers;
+      $statMode.textContent = d.iroh === 'connected' ? 'p2p' : 'relay';
+      $statMode.style.color = d.iroh === 'connected' ? 'var(--accent)' : 'var(--muted)';
+    } catch (_) {}
+  }
+
+  // ── peer modal ────────────────────────────────────────────────────────────
+  $peerBtn.addEventListener('click', openModal);
+
+  async function openModal() {
+    $modal.classList.add('visible');
+    $myTicket.textContent = 'fetching…';
+    try {
+      const d = await (await fetch('/ticket')).json();
+      myTicket = d.ticket || null;
+      $myTicket.textContent = d.ticket || d.error || 'iroh unavailable in this mode';
+    } catch (_) {
+      $myTicket.textContent = 'could not fetch ticket';
+    }
+  }
+
+  function closeModal() {
+    $modal.classList.remove('visible');
+    $peerIn.value = '';
+  }
+
+  function copyTicket() {
+    if (myTicket) navigator.clipboard.writeText(myTicket).catch(() => {});
+  }
+
+  async function connectPeer() {
+    const ticket = $peerIn.value.trim();
+    if (!ticket) return;
+    const btn = document.getElementById('connect-btn');
+    btn.disabled = true; btn.textContent = 'connecting…';
+    try {
+      const r = await fetch('/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticket }),
+      });
+      const d = await r.json();
+      if (d.ok) { closeModal(); pollHealth(); }
+      else { alert('Connection failed: ' + (d.error || 'unknown')); }
+    } catch (err) {
+      alert('Connection failed: ' + err.message);
+    } finally {
+      btn.disabled = false; btn.textContent = 'connect';
+    }
+  }
+
+  $modal.addEventListener('click', e => { if (e.target === $modal) closeModal(); });
+
+  // ── init ──────────────────────────────────────────────────────────────────
+  connect();
+  pollHealth();
+  setInterval(pollHealth, 5000);
+</script>
+</body>
+</html>
