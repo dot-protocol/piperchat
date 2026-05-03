@@ -1,7 +1,7 @@
 {
   "name": "piperchat",
-  "version": "0.1.0",
-  "description": "P2P chat over iroh document sync — no servers, no accounts",
+  "version": "1.0.0",
+  "description": "P2P chat with Ed25519-signed identities, SQLite storage, and SSE relay",
   "license": "Apache-2.0",
   "author": "The Pied Piper Authors",
   "main": "server.js",
@@ -10,9 +10,11 @@
     "dev": "node --watch server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
-    "@number0/iroh": "^0.35.0"
+    "@number0/iroh": "^0.35.0",
+    "better-sqlite3": "^12.9.0",
+    "tweetnacl": "^1.0.3"
   }
 }

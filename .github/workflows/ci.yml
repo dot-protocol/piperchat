@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: install dependencies
+        run: npm install
+
+      - name: syntax check (node --check)
+        run: |
+          node --check server.js
+          node --check client.js
+          node --check lib/db.js
+          node --check lib/crypto.js
+          node --check lib/ratelimit.js
+          node --check lib/telemetry.js
+
+      - name: smoke test
+        run: |
+          # boot server on an alternate port
+          PORT=4199 node server.js &
+          SERVER_PID=$!
+          sleep 3
+
+          # health check
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4199/health)
+          if [ "$STATUS" != "200" ]; then
+            echo "health check failed: got $STATUS"
+            kill $SERVER_PID
+            exit 1
+          fi
+          echo "health: OK"
+
+          # post a legacy unsigned message to main channel
+          RESP=$(curl -s -X POST "http://localhost:4199/messages?channel=main" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"ci smoke test","author":"ci-bot"}')
+          echo "post response: $RESP"
+          echo "$RESP" | node -e "const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')); if (!d.ok) { console.error('post failed'); process.exit(1); }"
+
+          # list channels
+          CHANNELS=$(curl -s http://localhost:4199/channels)
+          echo "channels: $CHANNELS"
+          echo "$CHANNELS" | node -e "const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')); if (!Array.isArray(d) || !d.find(c=>c.name==='main')) { console.error('main channel missing'); process.exit(1); }"
+
+          # post a signed message using tweetnacl
+          node -e "
+            const nacl = require('tweetnacl');
+            const kp = nacl.sign.keyPair();
+            const pubkey = Buffer.from(kp.publicKey).toString('hex');
+            const channel = 'main';
+            const signed_at = Date.now();
+            const content = 'signed smoke test';
+            const canonical = \`v1\n\${pubkey}\n\${channel}\n\${signed_at}\n\${content}\`;
+            const sig = Buffer.from(nacl.sign.detached(Buffer.from(canonical), kp.secretKey)).toString('hex');
+            const http = require('http');
+            const body = JSON.stringify({content, channel, author_name:'ci-signer', pubkey, signature: sig, signed_at});
+            const req = http.request({hostname:'localhost',port:4199,path:'/messages?channel=main',method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}}, res => {
+              let d = ''; res.on('data', c => d += c);
+              res.on('end', () => {
+                const parsed = JSON.parse(d);
+                if (!parsed.ok) { console.error('signed post failed', parsed); process.exit(1); }
+                if (parsed.message && parsed.message.signed) { console.log('signed message accepted'); }
+                else { console.error('message not marked signed', parsed); process.exit(1); }
+              });
+            });
+            req.on('error', e => { console.error(e); process.exit(1); });
+            req.write(body);
+            req.end();
+          "
+
+          kill $SERVER_PID
+          # clean up test data
+          rm -rf data/

@@ -1,0 +1,30 @@
+# Copyright 2026 The Pied Piper Authors — Apache 2.0
+services:
+  piperchat:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${PORT:-4100}:4100"
+    volumes:
+      - piperchat-data:/data
+    environment:
+      - PORT=4100
+      - DB_PATH=/data/piperchat.db
+      - DATA_DIR=/data
+      # optional — set to enable PostHog telemetry
+      # - POSTHOG_API_KEY=phc_...
+      # optional — comma-separated origins, defaults to * (open)
+      # - ALLOWED_ORIGINS=https://chat.piedpiper.fun
+    healthcheck:
+      test: ["CMD", "node", "-e",
+             "require('http').get('http://localhost:4100/health',
+             r => { if (r.statusCode !== 200) process.exit(1); })
+             .on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  piperchat-data:
+    driver: local

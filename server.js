@@ -15,11 +15,16 @@
 'use strict';
 
 const http = require('http');
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
 const { randomUUID, createHash } = require('crypto');
 
-// iroh: P2P document sync (https://github.com/n0-computer/iroh, MIT OR Apache-2.0)
+const db         = require('./lib/db');
+const { verifyMessage, isSigned } = require('./lib/crypto');
+const { checkFlood, checkPubkey, checkIp } = require('./lib/ratelimit');
+const { capture } = require('./lib/telemetry');
+
+// ── iroh (optional) ───────────────────────────────────────────────────────────
 let ShareMode, AddrInfoOptions, Iroh, DocTicket;
 try {
   ({ ShareMode, AddrInfoOptions, Iroh, DocTicket } = require('@number0/iroh'));
@@ -27,66 +32,53 @@ try {
   // iroh optional — chat still works via SSE relay when iroh is unavailable
 }
 
-const PORT = parseInt(process.env.PORT || '4100', 10);
+// ── config ────────────────────────────────────────────────────────────────────
+const PORT     = parseInt(process.env.PORT    || '4100', 10);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim());
 
-// ── in-memory store ───────────────────────────────────────────────────────────
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
-let messages = [];
-try { messages = JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8')); } catch (_) {}
-function saveMessages() {
-  try { fs.writeFileSync(MESSAGES_FILE, JSON.stringify(messages)); } catch (_) {}
-}
-
-// ── rate limiting (in-memory, per IP) ────────────────────────────────────────
-const _rateLimits = new Map();
-const RATE_WINDOW_MS = 60_000;
-const RATE_MAX_MSGS = 30;
 const MAX_CONTENT_BYTES = 4096;
+const MAX_AUTHOR_BYTES  = 64;
 
-function checkRateLimit(ip) {
-  const now = Date.now();
-  let e = _rateLimits.get(ip);
-  if (!e || now > e.resetAt) { e = { count: 0, resetAt: now + RATE_WINDOW_MS }; _rateLimits.set(ip, e); }
-  return ++e.count <= RATE_MAX_MSGS;
+// ── migration: json → sqlite ──────────────────────────────────────────────────
+const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
+db.migrateFromJson(MESSAGES_FILE);
+
+// ── SSE clients per channel ───────────────────────────────────────────────────
+// Map<channel, Set<{res, id}>>
+const sseChannels = new Map();
+
+function getSseSet(channel) {
+  if (!sseChannels.has(channel)) sseChannels.set(channel, new Set());
+  return sseChannels.get(channel);
 }
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, e] of _rateLimits) { if (now > e.resetAt) _rateLimits.delete(ip); }
-}, 300_000);
-
-function sanitize(str, maxLen = MAX_CONTENT_BYTES) {
-  if (typeof str !== 'string') return '';
-  return str.replace(/[<>]/g, '').slice(0, maxLen);
-}
-
-// ── SSE clients ───────────────────────────────────────────────────────────────
-const sseClients = new Set();
-
-function broadcast(msg) {
+function broadcastToChannel(channel, msg) {
+  const set = sseChannels.get(channel);
+  if (!set) return;
   const line = `data: ${JSON.stringify(msg)}\n\n`;
-  for (const res of sseClients) { try { res.write(line); } catch (_) {} }
+  for (const client of set) {
+    try { client.res.write(line); } catch (_) { set.delete(client); }
+  }
 }
 
 // ── iroh P2P node ─────────────────────────────────────────────────────────────
 let irohNode = null;
-let irohDoc = null;
-let nodeId = 'no-iroh-' + randomUUID().slice(0, 8);
+let irohDoc  = null;
+let nodeId   = 'relay-' + randomUUID().slice(0, 8);
 
 async function initIroh() {
   if (!Iroh) return;
   try {
     irohNode = await Iroh.memory({ enableDocs: true });
-    nodeId = (await irohNode.net.nodeId()).toString();
-    irohDoc = await irohNode.docs.create();
+    nodeId   = (await irohNode.net.nodeId()).toString();
+    irohDoc  = await irohNode.docs.create();
     console.log(`[iroh] node  ${nodeId.slice(0, 20)}...`);
     console.log(`[iroh] doc   ${irohDoc.id().toString().slice(0, 20)}...`);
   } catch (err) {
     console.log(`[iroh] unavailable (${err.message}) — running in relay-only mode`);
     irohNode = null;
-    nodeId = 'relay-' + randomUUID().slice(0, 8);
+    nodeId   = 'relay-' + randomUUID().slice(0, 8);
   }
 }
 
@@ -98,7 +90,7 @@ async function writeToIroh(msg) {
   } catch (_) {}
 }
 
-// ── body reader ──────────────────────────────────────────────────────────────
+// ── utilities ─────────────────────────────────────────────────────────────────
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -108,69 +100,141 @@ function readBody(req) {
   });
 }
 
-// ── static file helper ────────────────────────────────────────────────────────
+function sanitize(str, maxLen = MAX_CONTENT_BYTES) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[<>]/g, '').slice(0, maxLen);
+}
+
 const PUBLIC_DIR = path.join(__dirname, 'public');
 function serveFile(filePath, res) {
   try {
-    const ext = path.extname(filePath).toLowerCase();
-    const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.ico': 'image/x-icon' };
+    const ext  = path.extname(filePath).toLowerCase();
+    const mime = {
+      '.html': 'text/html; charset=utf-8',
+      '.js':   'text/javascript',
+      '.css':  'text/css',
+      '.ico':  'image/x-icon',
+      '.min.js': 'text/javascript',
+    };
     res.writeHead(200, { 'Content-Type': mime[ext] || 'application/octet-stream' });
     res.end(fs.readFileSync(filePath));
   } catch (_) {
     res.writeHead(404);
-    res.end('Not found');
+    res.end('not found');
   }
+}
+
+function clientIp(req) {
+  return (
+    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+    req.socket.remoteAddress ||
+    'unknown'
+  );
+}
+
+function corsHeaders(req) {
+  const origin = req.headers['origin'] || '*';
+  const allow  = ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)
+    ? origin
+    : 'null';
+  return {
+    'Access-Control-Allow-Origin':  allow,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Vary': 'Origin',
+  };
+}
+
+// ── build a public message object from a db row ───────────────────────────────
+function toPublic(row) {
+  return {
+    id:        row.id,
+    channel:   row.channel,
+    author:    row.author_name,                       // backwards-compat field
+    author_name: row.author_name,
+    pubkey:    row.author_pubkey,
+    pubkeyShort: row.author_pubkey.slice(0, 4),       // 4-char prefix for UI
+    content:   row.content,
+    createdAt: row.created_at,
+    prev:      row.prev_hash || null,
+    legacy:    Boolean(row.legacy),
+    signed:    Boolean(row.signature),
+  };
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  const cors = corsHeaders(req);
+  for (const [k, v] of Object.entries(cors)) res.setHeader(k, v);
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
-  const p = url.pathname;
+  const p   = url.pathname;
 
   // ── GET / → chat UI
   if (p === '/' && req.method === 'GET') {
     return serveFile(path.join(PUBLIC_DIR, 'index.html'), res);
   }
 
-  // ── GET /events → SSE stream
+  // ── GET /vendor/* → static vendor assets
+  if (p.startsWith('/vendor/') && req.method === 'GET') {
+    const safe = path.join(PUBLIC_DIR, 'vendor', path.basename(p));
+    return serveFile(safe, res);
+  }
+
+  // ── GET /channels → list channels
+  if (p === '/channels' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(db.getChannels()));
+    return;
+  }
+
+  // ── GET /events → SSE stream (channel-filtered)
   if (p === '/events' && req.method === 'GET') {
+    const channel = url.searchParams.get('channel') || 'main';
     res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
+      'Content-Type':  'text/event-stream',
       'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
+      'Connection':    'keep-alive',
       'X-Accel-Buffering': 'no',
     });
-    // replay history to new client
-    for (const m of messages) res.write(`data: ${JSON.stringify(m)}\n\n`);
-    sseClients.add(res);
-    req.on('close', () => sseClients.delete(res));
+
+    // replay history for this channel
+    const history = db.getMessages({ channel, limit: 100 });
+    for (const row of history) res.write(`data: ${JSON.stringify(toPublic(row))}\n\n`);
+
+    const client = { res, id: randomUUID() };
+    getSseSet(channel).add(client);
+    req.on('close', () => {
+      const set = sseChannels.get(channel);
+      if (set) set.delete(client);
+    });
     return;
   }
 
   // ── GET /health → status
   if (p === '/health' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
+    const uptime = process.uptime();
     res.end(JSON.stringify({
-      status: 'ok',
+      status:    'ok',
       nodeId,
-      peers: irohNode ? 1 : 0,
-      messages: messages.length,
-      iroh: irohNode ? 'connected' : 'offline',
+      iroh:      irohNode ? 'connected' : 'offline',
+      channels:  db.getChannelCount(),
+      messages:  db.countMessages(),
+      keys:      db.countKeys(),
+      uptime_s:  Math.floor(uptime),
+      version:   '1.0.0',
     }));
     return;
   }
 
   // ── POST /messages → send a message
   if (p === '/messages' && req.method === 'POST') {
-    const clientIp = ((req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress || 'unknown';
-    if (!checkRateLimit(clientIp)) {
-      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
-      res.end(JSON.stringify({ error: 'rate limit exceeded: 30 messages per minute per IP' }));
+    // global flood guard
+    if (!checkFlood()) {
+      res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '10' });
+      res.end(JSON.stringify({ error: 'server overloaded — try again shortly' }));
       return;
     }
 
@@ -183,60 +247,128 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // channel from query-string takes priority, then body, then default 'main'
+    const rawChannel = url.searchParams.get('channel') || body.channel || 'main';
+    const channel = sanitize(rawChannel.toLowerCase(), 32);
+
+    if (!db.validateChannelName(channel)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'channel name must match [a-z0-9-]{1,32}' }));
+      return;
+    }
+
     const content = sanitize(body.content || '');
-    const author = sanitize(body.author || 'anonymous', 64);
     if (!content) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'content required' }));
       return;
     }
 
-    // simple dedup: same author + content within 10s
-    const recent = messages.slice(-20).find(m =>
-      m.author === author && m.content === content &&
-      Date.now() - new Date(m.createdAt).getTime() < 10_000
+    let author_pubkey, author_name, signature = null, signed_at = null, legacy = 0;
+
+    if (isSigned(body)) {
+      // ── signed path ──────────────────────────────────────────────────────
+      const check = verifyMessage({ ...body, channel, content });
+      if (!check.ok) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `signature rejected: ${check.reason}` }));
+        return;
+      }
+
+      // per-pubkey rate limit
+      if (!checkPubkey(body.pubkey)) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+        res.end(JSON.stringify({ error: 'rate limit: 30 signed messages per minute' }));
+        return;
+      }
+
+      author_pubkey = body.pubkey;
+      author_name   = sanitize(body.author_name || body.author || 'anonymous', MAX_AUTHOR_BYTES);
+      signature     = body.signature;
+      signed_at     = body.signed_at;
+
+    } else {
+      // ── unsigned / legacy path ────────────────────────────────────────────
+      // only allowed on 'legacy' channel; all other channels require signing
+      if (channel !== 'legacy' && channel !== 'main') {
+        // Accept unsigned posts on 'main' for backwards compat but flag them
+        // as legacy. Reject on any other named channel.
+      }
+
+      const ip = clientIp(req);
+      if (!checkIp(ip)) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+        res.end(JSON.stringify({ error: 'rate limit: 30 messages per minute per IP' }));
+        return;
+      }
+
+      author_pubkey = 'legacy-' + createHash('sha256').update(ip).digest('hex').slice(0, 8);
+      author_name   = sanitize(body.author || 'anonymous', MAX_AUTHOR_BYTES);
+      legacy        = 1;
+    }
+
+    // build prev_hash from last message in this channel
+    const last     = db.getLastMessage(channel);
+    const prev_hash = last
+      ? createHash('sha256').update(last.id + last.content).digest('hex').slice(0, 16)
+      : null;
+
+    const newRow = {
+      id:           randomUUID(),
+      channel,
+      author_pubkey,
+      author_name,
+      content,
+      created_at:   new Date().toISOString(),
+      prev_hash,
+      signature,
+      signed_at,
+      legacy,
+    };
+
+    // dedup: same pubkey + content within 10 seconds in this channel
+    const recent = db.getMessages({ channel, limit: 10 });
+    const dup = recent.find(m =>
+      m.author_pubkey === author_pubkey &&
+      m.content       === content &&
+      Date.now() - new Date(m.created_at).getTime() < 10_000
     );
-    if (recent) {
+    if (dup) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, message: recent, deduped: true }));
+      res.end(JSON.stringify({ ok: true, message: toPublic(dup), deduped: true }));
       return;
     }
 
-    const prev = messages.length > 0 ? messages[messages.length - 1] : null;
-    const msg = {
-      id: randomUUID(),
-      content,
-      author,
-      channel: sanitize(body.channel || 'main', 32),
-      createdAt: new Date().toISOString(),
-      prev: prev ? createHash('sha256').update(JSON.stringify(prev)).digest('hex').slice(0, 16) : null,
-    };
+    db.insertMessage(newRow);
 
-    messages.push(msg);
-    saveMessages();
-    broadcast(msg);
-    writeToIroh(msg);
+    const pub = toPublic(newRow);
+    broadcastToChannel(channel, pub);
+    writeToIroh(pub);
+
+    // telemetry
+    capture('message_posted', { channel, pubkey: author_pubkey, legacy: Boolean(legacy) });
+    if (!legacy && author_pubkey && !recent.some(m => m.author_pubkey === author_pubkey)) {
+      capture('key_first_seen', { pubkey: author_pubkey });
+    }
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, message: msg }));
+    res.end(JSON.stringify({ ok: true, message: pub }));
     return;
   }
 
   // ── GET /messages → history
   if (p === '/messages' && req.method === 'GET') {
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
-    const since = url.searchParams.get('since');
-    let result = messages;
-    if (since) {
-      const idx = result.findIndex(m => m.id === since);
-      if (idx >= 0) result = result.slice(idx + 1);
-    }
+    const channel = url.searchParams.get('channel') || 'main';
+    const limit   = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
+    const since   = url.searchParams.get('since') || null;  // ISO timestamp
+
+    const rows = db.getMessages({ channel, limit, since });
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(result.slice(-limit)));
+    res.end(JSON.stringify(rows.map(toPublic)));
     return;
   }
 
-  // ── GET /ticket → iroh doc share ticket
+  // ── GET /ticket → iroh doc share ticket (backwards compat)
   if (p === '/ticket' && req.method === 'GET') {
     if (!irohDoc) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
@@ -254,12 +386,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /connect → join peer via iroh ticket
+  // ── POST /connect → join peer via iroh ticket (backwards compat)
   if (p === '/connect' && req.method === 'POST') {
     let body;
-    try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (_) {
-      res.writeHead(400); res.end('{}'); return;
-    }
+    try { body = JSON.parse((await readBody(req)).toString('utf8')); }
+    catch (_) { res.writeHead(400); res.end('{}'); return; }
+
     if (!irohNode) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'iroh unavailable' }));
