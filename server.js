@@ -266,6 +266,22 @@ const server = http.createServer(async (req, res) => {
 
     let author_pubkey, author_name, signature = null, signed_at = null, legacy = 0;
 
+    // If the body contains any signing field but doesn't pass isSigned(), the
+    // client is attempting to sign but sent malformed fields (e.g. base64 instead
+    // of hex, wrong length, non-numeric signed_at).  Reject explicitly rather
+    // than silently degrading to legacy — silent degradation was the root cause
+    // of the signed-path bug reported 2026-05-04.
+    const looksLikeSigned = body.pubkey || body.signature || body.signed_at;
+    if (looksLikeSigned && !isSigned(body)) {
+      const problems = [];
+      if (typeof body.pubkey    !== 'string' || body.pubkey.length    !== 64)  problems.push(`pubkey must be 64 hex chars (got ${typeof body.pubkey === 'string' ? body.pubkey.length : typeof body.pubkey})`);
+      if (typeof body.signature !== 'string' || body.signature.length !== 128) problems.push(`signature must be 128 hex chars (got ${typeof body.signature === 'string' ? body.signature.length : typeof body.signature})`);
+      if (typeof body.signed_at !== 'number')                                  problems.push(`signed_at must be a number (ms epoch), got ${typeof body.signed_at}`);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `malformed signing fields: ${problems.join('; ')}` }));
+      return;
+    }
+
     if (isSigned(body)) {
       // ── signed path ──────────────────────────────────────────────────────
       const check = verifyMessage({ ...body, channel, content });
