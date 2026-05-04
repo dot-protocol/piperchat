@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>piper-chat</title>
-  <script src="/vendor/tweetnacl.min.js"></script>
+  <script src="vendor/tweetnacl.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -472,6 +472,11 @@
 <script>
 'use strict';
 
+// ── deploy prefix (works at /, /chat/, /chat, or any sub-path) ───────────────
+const BASE = location.pathname.endsWith('/')
+  ? location.pathname
+  : location.pathname.replace(/\/[^/]*$/, '/') || '/';
+
 // ── keypair (IndexedDB-persisted) ─────────────────────────────────────────────
 
 const IDB_DB   = 'piperchat';
@@ -664,7 +669,7 @@ async function sendMsg() {
       channel:     activeChannel,
       ...signing,
     };
-    await fetch(`/messages?channel=${encodeURIComponent(activeChannel)}`, {
+    await fetch(`${BASE}messages?channel=${encodeURIComponent(activeChannel)}`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(payload),
@@ -681,7 +686,7 @@ async function sendMsg() {
 // ── SSE ───────────────────────────────────────────────────────────────────────
 function connectSSE() {
   if (eventSource) { eventSource.close(); eventSource = null; }
-  eventSource = new EventSource(`/events?channel=${encodeURIComponent(activeChannel)}`);
+  eventSource = new EventSource(`${BASE}events?channel=${encodeURIComponent(activeChannel)}`);
   eventSource.onmessage = e => {
     try { renderMsg(JSON.parse(e.data)); } catch (_) {}
   };
@@ -735,7 +740,7 @@ function esc(s) {
 // ── health poll ───────────────────────────────────────────────────────────────
 async function pollHealth() {
   try {
-    const d = await (await fetch('/health')).json();
+    const d = await (await fetch(`${BASE}health`)).json();
     $peers.textContent = d.peers || 0;
     $statMode.textContent  = d.iroh === 'connected' ? 'p2p' : 'relay';
     $statMode.style.color  = d.iroh === 'connected' ? 'var(--accent)' : 'var(--muted)';
@@ -745,7 +750,7 @@ async function pollHealth() {
 // ── channel list poll ─────────────────────────────────────────────────────────
 async function pollChannels() {
   try {
-    const list = await (await fetch('/channels')).json();
+    const list = await (await fetch(`${BASE}channels`)).json();
     if (Array.isArray(list)) {
       for (const ch of list) addChannelIfNew(ch.name);
     }
@@ -759,7 +764,7 @@ async function openModal() {
   $modal.classList.add('visible');
   $myTicket.textContent = 'fetching…';
   try {
-    const d = await (await fetch('/ticket')).json();
+    const d = await (await fetch(`${BASE}ticket`)).json();
     myTicket = d.ticket || null;
     $myTicket.textContent = d.ticket || d.error || 'iroh unavailable in relay-only mode';
   } catch (_) {
@@ -782,7 +787,7 @@ async function connectPeer() {
   const btn = document.getElementById('connect-btn');
   btn.disabled = true; btn.textContent = 'connecting…';
   try {
-    const r = await fetch('/connect', {
+    const r = await fetch(`${BASE}connect`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ ticket }),
