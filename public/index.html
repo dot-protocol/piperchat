@@ -625,6 +625,7 @@ function switchChannel(ch) {
   $empty.style.display = '';
   renderChannelList();
   connectSSE();
+  updateHash(ch);
 }
 
 function addChannelIfNew(ch) {
@@ -818,13 +819,6 @@ window.addEventListener('hashchange', () => {
   const ch = parseHashChannel();
   if (ch && ch !== activeChannel) switchChannel(ch);
 });
-
-// intercept switchChannel to also update hash
-const _origSwitch = switchChannel;
-function switchChannel(ch) {
-  _origSwitch(ch);
-  updateHash(ch);
-}
 
 // ── init ──────────────────────────────────────────────────────────────────────
 (async () => {
