@@ -1,0 +1,629 @@
+# Caddyfile.path-d — Canonical Caddy translation of all VPS nginx vhosts
+# Path-D test config: listens on :8090 (HTTP) only
+# DO NOT replace /etc/caddy/Caddyfile — this is the side-by-side validation config
+# All site blocks use :<host>:8090 pattern and match on Host header
+#
+# Cutover: when Blaze approves, copy to /etc/caddy/Caddyfile, remove `:8090` suffixes,
+#          add TLS directives, then: systemctl stop nginx && systemctl start caddy
+#
+# Generated: 2026-05-03
+
+{
+    auto_https off
+    admin off
+    log {
+        output file /var/log/caddy/path-d-test.log
+        format console
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# oracle.axxis.world — Kin brain + AXXIS public MCP
+# ROCK 1: Bearer token gate on catchall. MUST return 401 for unauthenticated requests.
+# /.well-known/* and /oauth/* are exempt (no auth required — same as nginx regex location).
+# ─────────────────────────────────────────────────────────────────────────────
+http://oracle.axxis.world:8090 {
+    # Use route to guarantee exact evaluation order (critical for bearer gate)
+    route {
+        # ── /mcp/* — public AXXIS MCP server (no auth) ────────────────────
+        @mcp_health path /mcp/health
+        handle @mcp_health {
+            header Access-Control-Allow-Origin "*"
+            reverse_proxy localhost:4081
+        }
+
+        @mcp_paths path /mcp/*
+        handle @mcp_paths {
+            @options_mcp method OPTIONS
+            respond @options_mcp 204
+
+            header Access-Control-Allow-Origin "*"
+            header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+            header Access-Control-Allow-Headers "Content-Type, Authorization"
+
+            reverse_proxy localhost:4081 {
+                header_up Host {host}
+                header_up X-Real-IP {remote_host}
+            }
+        }
+
+        # ── /oracle/* — pass through (tree_serve enforces auth internally) ─
+        @oracle_paths path /oracle/*
+        handle @oracle_paths {
+            reverse_proxy localhost:8892 {
+                header_up Host {host}
+                header_up X-Real-IP {remote_host}
+            }
+        }
+
+        # ── /health — public health check ──────────────────────────────────
+        @health_path path /health
+        handle @health_path {
+            reverse_proxy localhost:8892 {
+                header_up Host {host}
+            }
+        }
+
+        # ── /.well-known/* — exempt from auth ──────────────────────────────
+        @wellknown path /.well-known/*
+        handle @wellknown {
+            reverse_proxy localhost:8892 {
+                header_up Host {host}
+            }
+        }
+
+        # ── /oauth/* — exempt from auth ────────────────────────────────────
+        @oauth_paths path /oauth/*
+        handle @oauth_paths {
+            reverse_proxy localhost:8892 {
+                header_up Host {host}
+            }
+        }
+
+        # ── /sync — WebSocket oplog sync (CC-010) ──────────────────────────
+        @sync_path path /sync
+        handle @sync_path {
+            reverse_proxy localhost:8893 {
+                header_up Host {host}
+                header_up X-Real-IP {remote_host}
+                header_up Upgrade {http.request.header.Upgrade}
+                header_up Connection {http.request.header.Connection}
+                header_up Authorization {http.request.header.Authorization}
+            }
+        }
+
+        # ── Catchall: ROCK 1 BEARER GATE ─────────────────────────────────
+        # ALL other paths require Authorization: Bearer <token>
+        handle {
+            @unauthed not header Authorization "Bearer sHSqxUNa4PHn4FtEFXgypZmforoRwFYSZgEmFimzJtLQzY5HIH85JL7g-8Wa3H4j"
+            respond @unauthed `{"error": "unauthorized"}` 401
+
+            reverse_proxy localhost:8892 {
+                header_up Host {host}
+                header_up X-Real-IP {remote_host}
+            }
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# api.mevici.com — MEVICI supernode (Let's Encrypt on real ports; test on :8090)
+# ─────────────────────────────────────────────────────────────────────────────
+http://api.mevici.com:8090 {
+    # ── /v1/ — supernode REST ─────────────────────────────────────────────
+    handle /v1/* {
+        reverse_proxy localhost:8080 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # ── /ws — supernode WebSocket ──────────────────────────────────────────
+    handle /ws {
+        reverse_proxy localhost:8081 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # ── /tree/ — Oracle MCP with CORS (no extra auth; tree_serve enforces bearer) ─
+    handle_path /tree/* {
+        @options_tree method OPTIONS
+        handle @options_tree {
+            header Access-Control-Allow-Origin "*"
+            header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+            header Access-Control-Allow-Headers "Authorization, Content-Type"
+            respond 204
+        }
+
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Authorization, Content-Type"
+
+
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Authorization, Content-Type"
+
+        reverse_proxy localhost:8892 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # ── /term/ — TermBeam terminal UI (WebSocket) ─────────────────────────
+    handle_path /term/* {
+        reverse_proxy localhost:4085 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # ── /kin/ — Kin server (WebSocket, no auth) ────────────────────────────
+    handle_path /kin/* {
+        reverse_proxy localhost:4041 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # ── /p2p/ — P2P Chat legacy ────────────────────────────────────────────
+    handle_path /p2p/* {
+        reverse_proxy localhost:4100 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # ── /tts/ — Piper TTS ──────────────────────────────────────────────────
+    handle_path /tts/* {
+        reverse_proxy localhost:4056 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # ── /chorus/ — CHORUS orchestrator (SSE + WebSocket) ─────────────────
+    handle_path /chorus/* {
+        reverse_proxy localhost:8895 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            flush_interval -1
+        }
+    }
+
+    # ── /ollama/ — ROCK 2: Ollama key guard (handle_path strips /ollama/ prefix) ─
+    handle_path /ollama/* {
+        @no_ollama_key not header X-Ollama-Key "8bb58fc3-de24-45e3-a404-f9fcf7656e0f"
+        respond @no_ollama_key 403
+
+        reverse_proxy localhost:11434 {
+            header_up Host localhost
+            header_up X-Real-IP {remote_host}
+            header_up X-Ollama-Key ""
+        }
+    }
+
+    # ── /pipernet/ — pipernet relay (SSE-safe) ────────────────────────────
+    handle_path /pipernet/* {
+        header Cache-Control "no-cache"
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Content-Type"
+
+        reverse_proxy localhost:8765 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            flush_interval -1
+        }
+    }
+
+    # ── /chat — redirect to trailing slash ─────────────────────────────────
+    @chat_no_slash path /chat
+    redir @chat_no_slash /chat/ 301
+
+    # ── /chat/ — piperchat (SSE-safe, signed messages) ───────────────────
+    handle_path /chat/* {
+        header Cache-Control "no-cache"
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Content-Type"
+
+        @options_chat method OPTIONS
+        respond @options_chat 204
+
+        reverse_proxy localhost:4101 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            flush_interval -1
+        }
+    }
+
+    # ── / catchall — supernode ────────────────────────────────────────────
+    handle {
+        reverse_proxy localhost:8080 {
+            header_up Host {host}
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# piedpiper.fun — VPS path handlers (CF tunnel routes /chat/* and /api/* here)
+# ─────────────────────────────────────────────────────────────────────────────
+http://piedpiper.fun:8090 {
+    # ── /chat/ — piperchat (SSE-safe) ────────────────────────────────────
+    handle_path /chat/* {
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Content-Type"
+
+        @options_chat method OPTIONS
+        respond @options_chat 204
+
+        reverse_proxy localhost:4101 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            flush_interval -1
+        }
+    }
+
+    # ── /api/relay/ — pipernet relay ─────────────────────────────────────
+    handle_path /api/relay/* {
+        header Cache-Control "no-cache"
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Content-Type, Authorization"
+
+        @options_relay method OPTIONS
+        respond @options_relay 204
+
+        reverse_proxy localhost:8765 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            flush_interval -1
+        }
+    }
+
+    # ── /api/pipernet/ — alternate relay prefix ──────────────────────────
+    handle_path /api/pipernet/* {
+        header Cache-Control "no-cache"
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Content-Type, Authorization"
+
+        @options_pipernet method OPTIONS
+        respond @options_pipernet 204
+
+        reverse_proxy localhost:8765 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            flush_interval -1
+        }
+    }
+
+    # ── Catchall — redirect to Vercel (as nginx does) ────────────────────
+    handle {
+        redir https://piedpiper.fun{uri} 302
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# relay.piedpiper.fun — pipernet relay (Let's Encrypt on real ports)
+# ─────────────────────────────────────────────────────────────────────────────
+http://relay.piedpiper.fun:8090 {
+    handle {
+        header Cache-Control "no-cache"
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Content-Type"
+
+        @options_relay method OPTIONS
+        respond @options_relay 204
+
+        reverse_proxy localhost:8765 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            flush_interval -1
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# monitor.piedpiper.fun — Netdata (ROCK 3: basicauth with bcrypt)
+# ─────────────────────────────────────────────────────────────────────────────
+http://monitor.piedpiper.fun:8090 {
+    basic_auth {
+        monitor $2a$14$3ElWtqrQmp9fknz0mEY5tuAgEER3fvTLeyAaJaED4d8I5NesPAjZy
+    }
+
+    handle {
+        reverse_proxy localhost:19999 {
+            header_up Host localhost
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# send.piedpiper.fun — Pied Piper Send (WebRTC signaling)
+# ─────────────────────────────────────────────────────────────────────────────
+http://send.piedpiper.fun:8090 {
+    handle {
+        reverse_proxy localhost:8766 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            flush_interval -1
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# agenthub.mevici.com — AgentHub (WebSocket)
+# ─────────────────────────────────────────────────────────────────────────────
+http://agenthub.mevici.com:8090 {
+    handle {
+        reverse_proxy localhost:8894 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# chorus.mevici.com — CHORUS orchestrator (SSE + WebSocket)
+# ─────────────────────────────────────────────────────────────────────────────
+http://chorus.mevici.com:8090 {
+    handle {
+        reverse_proxy localhost:8895 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            flush_interval -1
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# openclaw.mevici.com — OpenClaw gateway (WebSocket + CORS)
+# ─────────────────────────────────────────────────────────────────────────────
+http://openclaw.mevici.com:8090 {
+    @options_oc method OPTIONS
+    handle @options_oc {
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Authorization, Content-Type, x-openclaw-agent-id"
+        respond 204
+    }
+
+    handle {
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Authorization, Content-Type, x-openclaw-agent-id"
+
+        reverse_proxy localhost:18789 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            lb_policy least_conn
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# kin.mevici.com — Kin server (WebSocket)
+# ─────────────────────────────────────────────────────────────────────────────
+http://kin.mevici.com:8090 {
+    handle /ws {
+        reverse_proxy localhost:4041 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    handle {
+        reverse_proxy localhost:4041 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# sandbox.mevici.com — static files from /opt/sandbox/files
+# ─────────────────────────────────────────────────────────────────────────────
+http://sandbox.mevici.com:8090 {
+    root * /opt/sandbox/files
+    file_server
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# demo.axxis.world — static files from /opt/axxis/demo
+# ─────────────────────────────────────────────────────────────────────────────
+http://demo.axxis.world:8090 {
+    header Access-Control-Allow-Origin "*"
+    header Cache-Control "public, max-age=60"
+
+    root * /opt/axxis/demo
+    file_server {
+        index index.html
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# id.axxis.world — identity-dns service (CORS)
+# ─────────────────────────────────────────────────────────────────────────────
+http://id.axxis.world:8090 {
+    @options_id method OPTIONS
+    respond @options_id 204
+
+    header Access-Control-Allow-Origin "*"
+    header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+    header Access-Control-Allow-Headers "Content-Type, Authorization"
+
+    handle {
+        reverse_proxy localhost:8896 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# drop.axxis.world — DOTdrop via Sentinel (large uploads: 110MB)
+# ─────────────────────────────────────────────────────────────────────────────
+http://drop.axxis.world:8090 {
+    @llms path /llms.txt /drop/llms.txt
+
+    handle @llms {
+        root * /opt/room
+        rewrite * /llms.txt
+        file_server
+        header Content-Type text/plain
+    }
+
+    handle {
+        request_body {
+            max_size 110MB
+        }
+        reverse_proxy localhost:4090 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# room.axxis.world — The Council/Room via Sentinel (WebSocket)
+# ─────────────────────────────────────────────────────────────────────────────
+http://room.axxis.world:8090 {
+    handle {
+        reverse_proxy localhost:4090 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFAULT SERVER (catch-all for direct IP / unknown hosts)
+# Mirrors the nginx default_server block: sentinel paths + VPS OK response
+# ─────────────────────────────────────────────────────────────────────────────
+:8090 {
+    handle /sentinel/* {
+        reverse_proxy localhost:4090 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /room/* {
+        reverse_proxy localhost:4090 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+        }
+    }
+
+    handle /p2p/* {
+        reverse_proxy localhost:4100 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            flush_interval -1
+        }
+    }
+
+    handle /player {
+        reverse_proxy localhost:8877 {
+            header_up Host {host}
+        }
+    }
+
+    handle /dotdrop/* {
+        reverse_proxy localhost:4090 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+        }
+    }
+
+    handle /dotpost/* {
+        reverse_proxy localhost:4090 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+        }
+    }
+
+    handle /post/* {
+        redir /post/index.html 302
+    }
+
+    handle /post/index.html {
+        root * /opt/room
+        rewrite * /dotpost.html
+        file_server
+        header Content-Type text/html
+    }
+
+    handle /drop/* {
+        request_body {
+            max_size 110MB
+        }
+        reverse_proxy localhost:4090 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+        }
+    }
+
+    handle /oracle-spec/* {
+        header Access-Control-Allow-Origin "*"
+        reverse_proxy localhost:4090 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle {
+        respond "VPS OK" 200
+    }
+}
