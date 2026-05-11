@@ -20,7 +20,10 @@ const path = require('path');
 const { randomUUID, createHash } = require('crypto');
 
 const db         = require('./lib/db');
-const { verifyMessage, isSigned } = require('./lib/crypto');
+const {
+  verifyMessage, isSigned,
+  isV11Signed, verifyMessageV11, validateAttachments,
+} = require('./lib/crypto');
 const { checkFlood, checkPubkey, checkIp } = require('./lib/ratelimit');
 const { capture } = require('./lib/telemetry');
 
@@ -147,19 +150,62 @@ function corsHeaders(req) {
 
 // ── build a public message object from a db row ───────────────────────────────
 function toPublic(row) {
-  return {
-    id:        row.id,
-    channel:   row.channel,
-    author:    row.author_name,                       // backwards-compat field
+  const base = {
+    id:          row.id,
+    channel:     row.channel,
+    version:     row.from_dot1 ? '1.1' : '1.0',
+    // v1.0 backwards-compat fields
+    author:      row.author_name,
     author_name: row.author_name,
-    pubkey:    row.author_pubkey,
-    pubkeyShort: row.author_pubkey.slice(0, 4),       // 4-char prefix for UI
-    content:   row.content,
-    createdAt: row.created_at,
-    prev:      row.prev_hash || null,
-    legacy:    Boolean(row.legacy),
-    signed:    Boolean(row.signature),
+    pubkey:      row.author_pubkey,
+    pubkeyShort: row.author_pubkey ? row.author_pubkey.slice(0, 4) : '',
+    content:     row.content,
+    createdAt:   row.created_at,
+    prev:        row.prev_hash || null,
+    legacy:      Boolean(row.legacy),
+    signed:      Boolean(row.signature) || Boolean(row.signed),
+    unsigned:    Boolean(row.unsigned_legacy),
   };
+
+  // v1.1 DOT-native fields (present only on v1.1 messages)
+  if (row.from_dot1) {
+    base.from_dot1        = row.from_dot1;
+    base.from_ed25519_pub = row.from_ed25519_pub;
+    // dot1 short form: last 6 hex chars of the 16-char address suffix
+    base.dot1Short        = row.from_dot1.replace('dot1:', '').slice(-6);
+    base.sig              = row.sig;
+  }
+
+  // Attachments — decode from JSON string, strip content_b64 for SSE/GET responses
+  // (content_b64 is stored and available on direct attachment fetch, not in message lists)
+  if (row.attachments_json) {
+    try {
+      const atts = JSON.parse(row.attachments_json);
+      if (Array.isArray(atts)) {
+        base.attachments = atts.map(a => ({
+          filename:   a.filename,
+          mime_type:  a.mime_type,
+          size_bytes: a.size_bytes,
+          sha256:     a.sha256,
+          // include content_b64 in full replies only — strip here for list/SSE
+        }));
+      }
+    } catch (_) {}
+  }
+
+  return base;
+}
+
+// toPublicFull includes content_b64 (for direct POST response only)
+function toPublicFull(row) {
+  const pub = toPublic(row);
+  if (row.attachments_json) {
+    try {
+      const atts = JSON.parse(row.attachments_json);
+      if (Array.isArray(atts)) pub.attachments = atts; // full, with content_b64
+    } catch (_) {}
+  }
+  return pub;
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
@@ -217,14 +263,15 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     const uptime = process.uptime();
     res.end(JSON.stringify({
-      status:    'ok',
+      status:           'ok',
       nodeId,
-      iroh:      irohNode ? 'connected' : 'offline',
-      channels:  db.getChannelCount(),
-      messages:  db.countMessages(),
-      keys:      db.countKeys(),
-      uptime_s:  Math.floor(uptime),
-      version:   '1.0.0',
+      iroh:             irohNode ? 'connected' : 'offline',
+      channels:         db.getChannelCount(),
+      messages:         db.countMessages(),
+      keys:             db.countKeys(),
+      uptime_s:         Math.floor(uptime),
+      version:          '1.1.0',
+      protocol_version: '1.1',
     }));
     return;
   }
@@ -265,14 +312,19 @@ const server = http.createServer(async (req, res) => {
     }
 
     let author_pubkey, author_name, signature = null, signed_at = null, legacy = 0;
+    // v1.1 DOT-native fields
+    let from_dot1 = null, from_ed25519_pub = null, sig_v11 = null, signed_v11 = 0;
+    let unsigned_legacy = 0;
+    let attachments_json = null;
+    // v1.1: use client-provided id/createdAt (signed over them); v1.0: server-generated
+    let msg_id         = randomUUID();
+    let msg_created_at = new Date().toISOString();
 
-    // If the body contains any signing field but doesn't pass isSigned(), the
-    // client is attempting to sign but sent malformed fields (e.g. base64 instead
-    // of hex, wrong length, non-numeric signed_at).  Reject explicitly rather
-    // than silently degrading to legacy — silent degradation was the root cause
-    // of the signed-path bug reported 2026-05-04.
-    const looksLikeSigned = body.pubkey || body.signature || body.signed_at;
-    if (looksLikeSigned && !isSigned(body)) {
+    // Pre-check: partial v1.0 signing fields (has some but not all).
+    // Handled before the three-way branch to give a precise error message.
+    const looksLikeV10 = (body.pubkey || body.signature || body.signed_at !== undefined) &&
+                         body.version !== '1.1' && !body.from_dot1;
+    if (looksLikeV10 && !isSigned(body)) {
       const problems = [];
       if (typeof body.pubkey    !== 'string' || body.pubkey.length    !== 64)  problems.push(`pubkey must be 64 hex chars (got ${typeof body.pubkey === 'string' ? body.pubkey.length : typeof body.pubkey})`);
       if (typeof body.signature !== 'string' || body.signature.length !== 128) problems.push(`signature must be 128 hex chars (got ${typeof body.signature === 'string' ? body.signature.length : typeof body.signature})`);
@@ -282,8 +334,71 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (isSigned(body)) {
-      // ── signed path ──────────────────────────────────────────────────────
+    // ── v1.1 DOT-native path ──────────────────────────────────────────────────
+    if (body.version === '1.1' || isV11Signed(body)) {
+
+      // Detect partial v1.1 (has version="1.1" or from_dot1 but missing sig fields)
+      if (!isV11Signed(body)) {
+        const problems = [];
+        if (!body.from_dot1 || !/^dot1:[0-9a-f]{16}$/.test(body.from_dot1))
+          problems.push('from_dot1 must match dot1:[0-9a-f]{16}');
+        if (typeof body.from_ed25519_pub !== 'string' || body.from_ed25519_pub.length !== 64)
+          problems.push('from_ed25519_pub must be 64 hex chars');
+        if (typeof body.sig !== 'string' || body.sig.length !== 128)
+          problems.push('sig must be 128 hex chars');
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `malformed v1.1 signing fields: ${problems.join('; ')}` }));
+        return;
+      }
+
+      // Validate + cap attachments before building the canonical bytes
+      const atts = validateAttachments(body.attachments);
+
+      // The signature covers the canonical form that the CLIENT built, which includes
+      // the client-supplied id and createdAt. We verify against those exact values.
+      // The server does NOT regenerate id/createdAt for the verification step.
+      const clientId        = (typeof body.id === 'string' && body.id.length > 0) ? body.id : randomUUID();
+      const clientCreatedAt = (typeof body.createdAt === 'string' && body.createdAt.length > 0)
+        ? body.createdAt : new Date().toISOString();
+
+      const msgForVerify = {
+        id:               clientId,
+        version:          '1.1',
+        content,
+        channel,
+        createdAt:        clientCreatedAt,
+        prev:             body.prev !== undefined ? body.prev : null,
+        from_dot1:        body.from_dot1,
+        from_ed25519_pub: body.from_ed25519_pub,
+      };
+
+      const check = verifyMessageV11({ ...msgForVerify, sig: body.sig }, atts);
+      if (!check.ok) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `v1.1 signature rejected: ${check.reason}` }));
+        return;
+      }
+
+      // per-pubkey rate limit (keyed on ed25519 pub)
+      if (!checkPubkey(body.from_ed25519_pub)) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+        res.end(JSON.stringify({ error: 'rate limit: 30 signed messages per minute' }));
+        return;
+      }
+
+      author_pubkey    = body.from_ed25519_pub; // use ed25519 pub as the storage key
+      author_name      = sanitize(body.author_name || body.author || body.from_dot1, MAX_AUTHOR_BYTES);
+      from_dot1        = body.from_dot1;
+      from_ed25519_pub = body.from_ed25519_pub;
+      sig_v11          = body.sig;
+      signed_v11       = 1;
+      if (atts.length > 0) attachments_json = JSON.stringify(atts);
+      // Preserve client-generated id and createdAt (they were signed over)
+      msg_id         = clientId;
+      msg_created_at = clientCreatedAt;
+
+    } else if (isSigned(body)) {
+      // ── v1.0 signed path ──────────────────────────────────────────────────
       const check = verifyMessage({ ...body, channel, content });
       if (!check.ok) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -305,12 +420,7 @@ const server = http.createServer(async (req, res) => {
 
     } else {
       // ── unsigned / legacy path ────────────────────────────────────────────
-      // only allowed on 'legacy' channel; all other channels require signing
-      if (channel !== 'legacy' && channel !== 'main') {
-        // Accept unsigned posts on 'main' for backwards compat but flag them
-        // as legacy. Reject on any other named channel.
-      }
-
+      // (partial v1.0 signing fields are caught above before this branch)
       const ip = clientIp(req);
       if (!checkIp(ip)) {
         res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
@@ -318,9 +428,13 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      author_pubkey = 'legacy-' + createHash('sha256').update(ip).digest('hex').slice(0, 8);
-      author_name   = sanitize(body.author || 'anonymous', MAX_AUTHOR_BYTES);
-      legacy        = 1;
+      author_pubkey   = 'legacy-' + createHash('sha256').update(ip).digest('hex').slice(0, 8);
+      author_name     = sanitize(body.author || 'anonymous', MAX_AUTHOR_BYTES);
+      legacy          = 1;
+      unsigned_legacy = 1;
+
+      // Emit a deprecation warning to telemetry for monitoring
+      capture('unsigned_message_posted', { channel, ip_hash: author_pubkey });
     }
 
     // build prev_hash from last message in this channel
@@ -330,16 +444,23 @@ const server = http.createServer(async (req, res) => {
       : null;
 
     const newRow = {
-      id:           randomUUID(),
+      id:              msg_id,
       channel,
       author_pubkey,
       author_name,
       content,
-      created_at:   new Date().toISOString(),
+      created_at:      msg_created_at,
       prev_hash,
       signature,
       signed_at,
       legacy,
+      // v1.1 fields
+      from_dot1,
+      from_ed25519_pub,
+      sig:             sig_v11,
+      signed:          signed_v11,
+      unsigned_legacy,
+      attachments_json,
     };
 
     // dedup: same pubkey + content within 10 seconds in this channel
@@ -351,24 +472,31 @@ const server = http.createServer(async (req, res) => {
     );
     if (dup) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, message: toPublic(dup), deduped: true }));
+      res.end(JSON.stringify({ ok: true, message: toPublicFull(dup), deduped: true }));
       return;
     }
 
     db.insertMessage(newRow);
 
-    const pub = toPublic(newRow);
+    const pub     = toPublic(newRow);     // for SSE broadcast (no content_b64)
+    const pubFull = toPublicFull(newRow); // for POST response (with content_b64)
     broadcastToChannel(channel, pub);
     writeToIroh(pub);
 
     // telemetry
-    capture('message_posted', { channel, pubkey: author_pubkey, legacy: Boolean(legacy) });
+    capture('message_posted', {
+      channel,
+      pubkey:  author_pubkey,
+      legacy:  Boolean(legacy),
+      version: from_dot1 ? '1.1' : '1.0',
+      signed:  Boolean(signed_v11 || signature),
+    });
     if (!legacy && author_pubkey && !recent.some(m => m.author_pubkey === author_pubkey)) {
       capture('key_first_seen', { pubkey: author_pubkey });
     }
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, message: pub }));
+    res.end(JSON.stringify({ ok: true, message: pubFull }));
     return;
   }
 
