@@ -15,30 +15,93 @@
 'use strict';
 
 // PiperClient — thin Node.js wrapper around piper-chat's HTTP + SSE API.
-// Zero dependencies. Node 18+ built-ins only.
+// Supports both v1.0 (legacy) and v1.1 (DOT-native, ed25519-signed) message formats.
+// Zero external dependencies beyond those already in package.json. Node 20+ built-ins only.
 
-const http  = require('http');
-const https = require('https');
+const http        = require('http');
+const https       = require('https');
+const fs          = require('fs');
+const { randomUUID, createHash } = require('crypto');
+
+// v1.1 crypto helpers (require tweetnacl from package.json)
+const { signMessageV11, verifyMessageV11, validateAttachments } = require('./lib/crypto');
 
 const DEFAULT_URL     = 'http://localhost:4101';
 const DEFAULT_CHANNEL = 'main';
 const BACKOFF_INITIAL = 1_000;
 const BACKOFF_MAX     = 30_000;
 
+// ── cell file parser ──────────────────────────────────────────────────────────
+/**
+ * Parse a cell_*.md file and extract the PUBKEYS section values.
+ * The PUBKEYS section looks like:
+ *   ## PUBKEYS (derived from canonical section — safe to share)
+ *   ed25519_pub: <64 hex chars>
+ *   x25519_pub:  <64 hex chars>
+ *
+ * @param {string} cellPath  - absolute path to the cell_*.md file
+ * @returns {{ ed25519_pub: string, x25519_pub: string, dot1: string } | null}
+ */
+function parseCellFile(cellPath) {
+  try {
+    const text = fs.readFileSync(cellPath, 'utf8');
+
+    // Extract dot1 address from "Personal `dot1:`:" line
+    const dot1Match = text.match(/\*\*Personal `dot1:`:\*\*\s*(dot1:[0-9a-f]{16})/);
+    const dot1      = dot1Match ? dot1Match[1] : null;
+
+    // Extract PUBKEYS section
+    const ed25519Match = text.match(/^ed25519_pub:\s*([0-9a-f]{64})\s*$/m);
+    const x25519Match  = text.match(/^x25519_pub:\s*([0-9a-f]{64})\s*$/m);
+
+    if (!ed25519Match) return null;
+
+    return {
+      ed25519_pub: ed25519Match[1],
+      x25519_pub:  x25519Match ? x25519Match[1] : null,
+      dot1:        dot1 || null,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 class PiperClient {
   /**
    * @param {object}  opts
-   * @param {string}  opts.author          - Required. Display name for this client.
-   * @param {string}  [opts.url]           - Base URL of the piper-chat server.
-   * @param {string}  [opts.channel]       - Default channel for send().
-   * @param {boolean} [opts.includeOwn]    - If true, subscribe() also fires for own messages.
+   * @param {string}  [opts.author]           - Display name for this client.
+   * @param {string}  [opts.url]              - Base URL of the piper-chat server.
+   * @param {string}  [opts.channel]          - Default channel for send().
+   * @param {boolean} [opts.includeOwn]       - If true, subscribe() also fires for own messages.
+   *
+   * v1.1 identity options (DOT-native signing):
+   * @param {string}  [opts.dot1]             - dot1: address (e.g. "dot1:6d94e2c24a06486b")
+   * @param {string}  [opts.ed25519PubHex]    - 64-hex ed25519 public key
+   * @param {string}  [opts.ed25519PrivHex]   - 128-hex ed25519 private key (seed+pub concatenated)
+   *                                            If provided, all outgoing messages are v1.1-signed.
+   * @param {string}  [opts.cellPath]         - Path to a cell_*.md file. If given, ed25519PubHex
+   *                                            and dot1 are read from the file's PUBKEYS section.
+   *                                            ed25519PrivHex must still be supplied separately.
    */
   constructor(opts = {}) {
-    if (!opts.author) throw new Error('PiperClient: opts.author is required');
-    this.author     = opts.author;
+    this.author     = opts.author || 'anonymous';
     this.url        = (opts.url || DEFAULT_URL).replace(/\/$/, '');
     this.channel    = opts.channel || DEFAULT_CHANNEL;
     this.includeOwn = Boolean(opts.includeOwn);
+
+    // v1.1 identity
+    this._dot1    = opts.dot1    || null;
+    this._ed25519Pub  = opts.ed25519PubHex  || null;
+    this._ed25519Priv = opts.ed25519PrivHex || null;
+
+    // Load pub+dot1 from cell file if provided (priv must still be supplied separately)
+    if (opts.cellPath) {
+      const parsed = parseCellFile(opts.cellPath);
+      if (parsed) {
+        if (!this._ed25519Pub && parsed.ed25519_pub) this._ed25519Pub = parsed.ed25519_pub;
+        if (!this._dot1 && parsed.dot1) this._dot1 = parsed.dot1;
+      }
+    }
 
     this._handlers   = new Set();   // subscribe() callbacks
     this._sseReq     = null;        // active http.ClientRequest
@@ -47,23 +110,43 @@ class PiperClient {
     this._retryTimer = null;
   }
 
+  /** Returns true if this client has a v1.1 signing identity configured. */
+  get canSignV11() {
+    return Boolean(this._ed25519Priv && this._ed25519Pub && this._dot1);
+  }
+
   // ── public API ──────────────────────────────────────────────────────────────
 
-  /** Send a message. Returns the stored message object from the server. */
-  async send(content, channel) {
-    const body = JSON.stringify({
-      content,
-      author:  this.author,
-      channel: channel || this.channel,
-    });
-    const res = await this._fetch('/messages', { method: 'POST', body });
+  /**
+   * Send a message. If the client has a v1.1 identity (dot1 + ed25519PrivHex),
+   * the message is signed with v1.1 protocol. Otherwise falls back to v1.0 unsigned.
+   *
+   * @param {string}  content             - Message text
+   * @param {string}  [channel]           - Override default channel
+   * @param {Array}   [attachments]       - DOTpost v1.3 attachments (optional)
+   *   Each item: { filename, mime_type, size_bytes, sha256, content_b64 }
+   * @returns {Promise<object>} - The stored message object from the server
+   */
+  async send(content, channel, attachments) {
+    const ch   = channel || this.channel;
+    const atts = validateAttachments(attachments || []);
+
+    if (this.canSignV11) {
+      return this._sendV11(content, ch, atts);
+    }
+
+    // v1.0 unsigned fallback
+    const body = JSON.stringify({ content, author: this.author, channel: ch });
+    const res  = await this._fetch('/messages', { method: 'POST', body });
     return res.message;
   }
 
   /**
    * Subscribe to incoming messages via SSE.
    * Calls handler(msg) for each new message.
-   * By default, skips messages from this client's own author name.
+   * By default, skips messages from this client's own dot1/author.
+   * For v1.1 messages, the handler receives a `verified` field indicating
+   * whether the signature was successfully verified client-side.
    * Returns an unsubscribe function.
    */
   subscribe(handler) {
@@ -92,6 +175,55 @@ class PiperClient {
   close() {
     this._closed = true;
     this._disconnectSSE();
+  }
+
+  // ── v1.1 signing internals ───────────────────────────────────────────────────
+
+  async _sendV11(content, channel, atts) {
+    const id        = randomUUID();
+    const createdAt = new Date().toISOString();
+
+    // Build the message to be signed (without sig)
+    const msgForSig = {
+      id,
+      version:          '1.1',
+      content,
+      channel,
+      createdAt,
+      prev:             null, // server fills this; canonical bytes include null
+      from_dot1:        this._dot1,
+      from_ed25519_pub: this._ed25519Pub,
+    };
+
+    const sig = signMessageV11(msgForSig, atts, this._ed25519Priv);
+
+    const payload = {
+      ...msgForSig,
+      sig,
+      author:      this.author,
+      author_name: this.author,
+      attachments: atts,
+    };
+
+    const res = await this._fetch('/messages', {
+      method: 'POST',
+      body:   JSON.stringify(payload),
+    });
+    return res.message;
+  }
+
+  /** Verify a v1.1 message received from the server. Returns the msg with `verified` field added. */
+  _verifyIncoming(msg) {
+    if (msg.version !== '1.1' || !msg.sig || !msg.from_ed25519_pub) {
+      return { ...msg, verified: false, unsigned: true };
+    }
+    try {
+      const atts  = (msg.attachments || []).map(a => ({ ...a, content_b64: a.content_b64 || '' }));
+      const check = verifyMessageV11(msg, atts);
+      return { ...msg, verified: check.ok };
+    } catch (_) {
+      return { ...msg, verified: false };
+    }
   }
 
   // ── internals ───────────────────────────────────────────────────────────────
@@ -127,12 +259,13 @@ class PiperClient {
 
   _connectSSE() {
     if (this._closed || this._sseReq) return;
-    const parsed = new URL(this.url + '/events');
-    const lib    = parsed.protocol === 'https:' ? https : http;
+    const chParam = encodeURIComponent(this.channel);
+    const parsed  = new URL(`${this.url}/events?channel=${chParam}`);
+    const lib     = parsed.protocol === 'https:' ? https : http;
     const options = {
       hostname: parsed.hostname,
       port:     parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path:     '/events',
+      path:     `/events?channel=${chParam}`,
       method:   'GET',
       headers:  { Accept: 'text/event-stream', 'Cache-Control': 'no-cache' },
     };
@@ -143,7 +276,7 @@ class PiperClient {
       const replayIds = new Set();
 
       // first batch of messages in history() to mark as replay
-      this._fetch('/messages?limit=500').then(hist => {
+      this._fetch(`/messages?limit=500&channel=${chParam}`).then(hist => {
         if (Array.isArray(hist)) hist.forEach(m => replayIds.add(m.id));
         isReplay = false;
       }).catch(() => { isReplay = false; });
@@ -156,9 +289,15 @@ class PiperClient {
           const line = block.trim();
           if (!line.startsWith('data:')) continue;
           try {
-            const msg = JSON.parse(line.slice(5).trim());
-            if (replayIds.has(msg.id)) continue; // skip history replay
-            if (!this.includeOwn && msg.author === this.author) continue;
+            const raw = JSON.parse(line.slice(5).trim());
+            if (replayIds.has(raw.id)) continue; // skip history replay
+            // own-message filter: skip if author matches by name OR dot1
+            if (!this.includeOwn) {
+              if (raw.author === this.author) continue;
+              if (this._dot1 && raw.from_dot1 === this._dot1) continue;
+            }
+            // verify v1.1 signatures client-side before delivering to handler
+            const msg = this._verifyIncoming(raw);
             for (const h of this._handlers) { try { h(msg); } catch (_) {} }
           } catch (_) {}
         }

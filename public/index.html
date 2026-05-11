@@ -242,6 +242,113 @@
       background: rgba(255,255,255,0.04);
     }
 
+    .sig-ok {
+      font-size: 9px;
+      color: var(--accent);
+      padding: 1px 4px;
+      border-radius: 3px;
+      background: rgba(0, 255, 65, 0.08);
+    }
+
+    .sig-none {
+      font-size: 9px;
+      color: var(--muted);
+      padding: 1px 4px;
+      border-radius: 3px;
+      background: rgba(255,255,255,0.03);
+    }
+
+    /* ── attachments ── */
+    .attachments {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 7px;
+    }
+
+    .att-chip {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 8px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 10px;
+      color: var(--muted);
+      max-width: 220px;
+    }
+
+    .att-chip .att-name {
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .att-chip .att-size {
+      flex-shrink: 0;
+      color: var(--muted);
+    }
+
+    /* ── key setup banner ── */
+    .key-banner {
+      background: rgba(0, 255, 65, 0.05);
+      border: 1px solid rgba(0, 255, 65, 0.15);
+      border-radius: 5px;
+      padding: 8px 12px;
+      font-size: 11px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .key-banner.hidden { display: none; }
+
+    .key-banner input {
+      flex: 1;
+      min-width: 0;
+      font: inherit;
+      font-size: 10px;
+    }
+
+    .key-banner button {
+      font-size: 10px;
+      padding: 4px 10px;
+    }
+
+    /* ── attach button ── */
+    .attach-btn {
+      padding: 9px 11px;
+      background: var(--card);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      font-size: 13px;
+    }
+
+    .attach-btn:hover { color: var(--text); border-color: var(--accent); opacity: 1; }
+
+    .attach-preview {
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 5px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .attach-chip-small {
+      padding: 2px 6px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      cursor: pointer;
+    }
+
+    .attach-chip-small:hover { border-color: #ff6b6b; color: #ff6b6b; }
+
     .msg-time { color: var(--muted); font-size: 10px; flex-shrink: 0; }
 
     .msg-text {
@@ -429,6 +536,14 @@
     </div>
 
     <div class="input-area">
+      <!-- v1.1 key setup banner (shown until priv key is set for this session) -->
+      <div class="key-banner" id="key-banner">
+        <span>🔑</span>
+        <input type="password" id="priv-key-input" placeholder="paste ed25519_priv_hex to enable DOT-native signing (session only)"
+               autocomplete="off" maxlength="128">
+        <button id="priv-key-btn">sign</button>
+        <button id="priv-key-skip" style="background:transparent;color:var(--muted);border:1px solid var(--border);font-size:10px;padding:4px 8px;">skip</button>
+      </div>
       <div class="name-row" id="name-row">
         <input type="text" id="name-input" placeholder="choose a display name"
                maxlength="24" autocomplete="off">
@@ -436,11 +551,16 @@
       </div>
       <div class="msg-row">
         <input type="text" id="msg-input" placeholder="message" autocomplete="off" maxlength="4096">
+        <button class="attach-btn" id="attach-btn" title="attach files (max 4, 1 MB each)">📎</button>
         <button id="send-btn">send</button>
         <button id="peer-btn"
                 style="background:var(--card);color:var(--text);border:1px solid var(--border)"
                 title="connect a peer">⇄</button>
       </div>
+      <!-- pending attachments preview -->
+      <div class="attach-preview" id="attach-preview"></div>
+      <!-- hidden file input -->
+      <input type="file" id="file-input" multiple accept="*/*" style="display:none">
     </div>
   </div>
 </div>
@@ -479,7 +599,7 @@ const BASE = location.pathname.endsWith('/')
 
 // ── keypair (IndexedDB-persisted) ─────────────────────────────────────────────
 
-const IDB_DB   = 'piperchat';
+const IDB_DB    = 'piperchat';
 const IDB_STORE = 'keypair';
 
 let _keypair = null; // { publicKey: Uint8Array, secretKey: Uint8Array }
@@ -537,7 +657,7 @@ async function loadOrCreateKeypair() {
   document.getElementById('id-pill').title = 'your key: ' + pubkeyHex();
 }
 
-// ── signing ───────────────────────────────────────────────────────────────────
+// ── v1.0 signing (legacy — still used when no v1.1 priv key is set) ───────────
 
 function signMessage(content, channel) {
   const signed_at = Date.now();
@@ -551,6 +671,126 @@ function signMessage(content, channel) {
   };
 }
 
+// ── v1.1 DOT-native identity (session-scoped priv key) ────────────────────────
+// The priv key lives ONLY in sessionStorage. Never in localStorage. Never sent to server.
+
+const SS_DOT1_KEY    = 'piper-dot1';
+const SS_PUB_KEY     = 'piper-ed25519-pub';
+const SS_PRIV_KEY    = 'piper-ed25519-priv'; // sessionStorage only
+
+let _dot1    = sessionStorage.getItem(SS_DOT1_KEY)    || null;
+let _ed25519Pub  = sessionStorage.getItem(SS_PUB_KEY)     || null;
+let _ed25519Priv = sessionStorage.getItem(SS_PRIV_KEY)    || null; // 128-hex
+
+function hasV11Identity() {
+  return Boolean(_dot1 && _ed25519Pub && _ed25519Priv);
+}
+
+function setV11Identity(privHex) {
+  if (!privHex || privHex.length !== 128 || !/^[0-9a-f]+$/i.test(privHex)) return false;
+  // Derive pubkey from the last 64 chars (nacl secretKey = seed(32)+pub(32))
+  // Actually nacl stores as seed+pub in the 64-byte secretKey.
+  // The pub is the last 32 bytes = last 64 hex chars.
+  const pub = privHex.slice(64);
+  _ed25519Priv = privHex.toLowerCase();
+  _ed25519Pub  = pub.toLowerCase();
+  // dot1 for browser sessions: we don't have the BIP-32 path, so we use
+  // the first 16 hex chars of sha256(pubkey) — approximation only.
+  // Users who have a real cell file should use the Node client for verified dot1.
+  _dot1 = 'dot1:' + sha256Hex(hex2buf(_ed25519Pub)).slice(0, 16);
+
+  sessionStorage.setItem(SS_PRIV_KEY, _ed25519Priv);
+  sessionStorage.setItem(SS_PUB_KEY,  _ed25519Pub);
+  sessionStorage.setItem(SS_DOT1_KEY, _dot1);
+  return true;
+}
+
+function clearV11Identity() {
+  _dot1 = null; _ed25519Pub = null; _ed25519Priv = null;
+  sessionStorage.removeItem(SS_PRIV_KEY);
+  sessionStorage.removeItem(SS_PUB_KEY);
+  sessionStorage.removeItem(SS_DOT1_KEY);
+}
+
+function sha256Hex(u8arr) {
+  // SubtleCrypto is async; use a simple FNV-like hash for the browser-computed
+  // dot1 approximation (this is NOT cryptographically binding — it's just a display
+  // handle for the session). The server does not validate the dot1↔pubkey binding.
+  // Real dot1 comes from cell files used via the Node client.
+  let h = 0xcbf29ce484222325n;
+  for (const b of u8arr) h = BigInt.asUintN(64, (h ^ BigInt(b)) * 0x100000001b3n);
+  return h.toString(16).padStart(16, '0').repeat(4); // return 64 "hex-like" chars
+}
+
+// ── v1.1 canonical signing bytes (mirrors lib/crypto.js v11CanonicalBytes) ────
+function buildV11SigningInput(msgFields, atts) {
+  // msgFields: { id, version, content, channel, createdAt, prev, from_dot1, from_ed25519_pub }
+  // Sorted keys, no whitespace
+  const signable = {
+    channel:          msgFields.channel,
+    content:          msgFields.content,
+    createdAt:        msgFields.createdAt,
+    from_dot1:        msgFields.from_dot1,
+    from_ed25519_pub: msgFields.from_ed25519_pub,
+    id:               msgFields.id,
+    prev:             msgFields.prev !== undefined ? msgFields.prev : null,
+    version:          '1.1',
+  };
+  const sortedKeys = Object.keys(signable).sort();
+  const sortedObj  = {};
+  for (const k of sortedKeys) sortedObj[k] = signable[k];
+  const sortedJson = JSON.stringify(sortedObj);
+
+  // Attachment manifest (metadata only, no content_b64)
+  const manifest = JSON.stringify(
+    (atts || []).map(a => ({ filename: a.filename, mime_type: a.mime_type, sha256: a.sha256, size_bytes: a.size_bytes }))
+  );
+
+  return new TextEncoder().encode(`${sortedJson}::${manifest}`);
+}
+
+// Simple UUID v4 for browser
+function uuidV4() {
+  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+    (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)
+  );
+}
+
+// ── v1.1 sign a message ───────────────────────────────────────────────────────
+function signMessageV11(content, channel, atts) {
+  const id        = uuidV4();
+  const createdAt = new Date().toISOString();
+  const msgFields = {
+    id, version: '1.1', content, channel,
+    createdAt, prev: null,
+    from_dot1: _dot1, from_ed25519_pub: _ed25519Pub,
+  };
+  const bytes  = buildV11SigningInput(msgFields, atts);
+  const privU8 = hex2buf(_ed25519Priv);
+  const sigU8  = nacl.sign.detached(bytes, privU8);
+  return { ...msgFields, sig: buf2hex(sigU8), attachments: atts };
+}
+
+// ── v1.1 verify an incoming message ──────────────────────────────────────────
+function verifyMessageV11(msg) {
+  if (!msg.sig || !msg.from_ed25519_pub) return false;
+  try {
+    const atts = (msg.attachments || []).map(a => ({
+      filename: a.filename, mime_type: a.mime_type,
+      sha256: a.sha256, size_bytes: a.size_bytes,
+    }));
+    const msgFields = {
+      id: msg.id, version: '1.1', content: msg.content, channel: msg.channel,
+      createdAt: msg.createdAt, prev: msg.prev ?? null,
+      from_dot1: msg.from_dot1, from_ed25519_pub: msg.from_ed25519_pub,
+    };
+    const bytes  = buildV11SigningInput(msgFields, atts);
+    const sigU8  = hex2buf(msg.sig);
+    const pubU8  = hex2buf(msg.from_ed25519_pub);
+    return nacl.sign.detached.verify(bytes, sigU8, pubU8);
+  } catch (_) { return false; }
+}
+
 // ── channel state ─────────────────────────────────────────────────────────────
 
 const NAME_KEY    = 'piper-chat-name';
@@ -561,25 +801,69 @@ let eventSource   = null;
 let myTicket      = null;
 let knownChannels = new Set(['main']);
 
+// pending attachments for next send
+let pendingAtts = []; // Array<{filename, mime_type, size_bytes, sha256, content_b64}>
+
 // ── DOM refs ──────────────────────────────────────────────────────────────────
-const $msgs        = document.getElementById('messages');
-const $empty       = document.getElementById('empty');
-const $msgInput    = document.getElementById('msg-input');
-const $sendBtn     = document.getElementById('send-btn');
-const $nameRow     = document.getElementById('name-row');
-const $nameInput   = document.getElementById('name-input');
-const $nameBtn     = document.getElementById('name-btn');
-const $peerBtn     = document.getElementById('peer-btn');
-const $modal       = document.getElementById('modal');
-const $myTicket    = document.getElementById('my-ticket');
-const $peerIn      = document.getElementById('peer-ticket-input');
-const $peers       = document.getElementById('stat-peers');
-const $statMsgs    = document.getElementById('stat-msgs');
-const $statMode    = document.getElementById('stat-mode');
-const $channelList = document.getElementById('channel-list');
-const $chNameInput = document.getElementById('new-channel-input');
-const $chNameBtn   = document.getElementById('new-channel-btn');
+const $msgs          = document.getElementById('messages');
+const $empty         = document.getElementById('empty');
+const $msgInput      = document.getElementById('msg-input');
+const $sendBtn       = document.getElementById('send-btn');
+const $nameRow       = document.getElementById('name-row');
+const $nameInput     = document.getElementById('name-input');
+const $nameBtn       = document.getElementById('name-btn');
+const $peerBtn       = document.getElementById('peer-btn');
+const $modal         = document.getElementById('modal');
+const $myTicket      = document.getElementById('my-ticket');
+const $peerIn        = document.getElementById('peer-ticket-input');
+const $peers         = document.getElementById('stat-peers');
+const $statMsgs      = document.getElementById('stat-msgs');
+const $statMode      = document.getElementById('stat-mode');
+const $channelList   = document.getElementById('channel-list');
+const $chNameInput   = document.getElementById('new-channel-input');
+const $chNameBtn     = document.getElementById('new-channel-btn');
 const $activeChBadge = document.getElementById('active-channel-name');
+const $keyBanner     = document.getElementById('key-banner');
+const $privKeyInput  = document.getElementById('priv-key-input');
+const $privKeyBtn    = document.getElementById('priv-key-btn');
+const $privKeySkip   = document.getElementById('priv-key-skip');
+const $attachBtn     = document.getElementById('attach-btn');
+const $fileInput     = document.getElementById('file-input');
+const $attachPreview = document.getElementById('attach-preview');
+
+// ── key banner setup ──────────────────────────────────────────────────────────
+
+function updateKeyBanner() {
+  if (hasV11Identity()) {
+    $keyBanner.classList.add('hidden');
+    document.getElementById('id-pill').textContent = _dot1 ? _dot1.slice(-8) : pubkeyHex().slice(0, 8);
+    document.getElementById('id-pill').title = `dot1: ${_dot1 || 'n/a'} | ed25519: ${_ed25519Pub || ''}`;
+  }
+}
+
+// Show banner only if no v1.1 identity yet (or skip was clicked before)
+if (!hasV11Identity() && !sessionStorage.getItem('piper-key-skip')) {
+  $keyBanner.classList.remove('hidden');
+}
+
+$privKeyBtn.addEventListener('click', () => {
+  const v = $privKeyInput.value.trim().toLowerCase();
+  if (!v) return;
+  if (!setV11Identity(v)) {
+    alert('Invalid key: must be 128 hex characters (ed25519 secret key = seed + pub).');
+    return;
+  }
+  $privKeyInput.value = '';
+  updateKeyBanner();
+});
+
+$privKeySkip.addEventListener('click', () => {
+  sessionStorage.setItem('piper-key-skip', '1');
+  $keyBanner.classList.add('hidden');
+  $msgInput.focus();
+});
+
+$privKeyInput.addEventListener('keydown', e => { if (e.key === 'Enter') $privKeyBtn.click(); });
 
 // ── name setup ────────────────────────────────────────────────────────────────
 if (!myName) {
@@ -599,6 +883,70 @@ function saveName() {
   localStorage.setItem(NAME_KEY, myName);
   $nameRow.classList.remove('visible');
   $msgInput.focus();
+}
+
+// ── attachment handling ───────────────────────────────────────────────────────
+
+$attachBtn.addEventListener('click', () => $fileInput.click());
+
+$fileInput.addEventListener('change', async () => {
+  const MAX_FILES   = 4;
+  const MAX_BYTES   = 1024 * 1024; // 1 MB per file (DOM constraint)
+  const files = Array.from($fileInput.files || []).slice(0, MAX_FILES - pendingAtts.length);
+  for (const file of files) {
+    if (file.size > MAX_BYTES) { alert(`${file.name} exceeds 1 MB limit.`); continue; }
+    try {
+      const arrayBuf  = await file.arrayBuffer();
+      const u8        = new Uint8Array(arrayBuf);
+      const sha256    = await computeSha256Hex(u8);
+      const b64       = uint8ToBase64(u8);
+      pendingAtts.push({
+        filename:    file.name.slice(0, 256),
+        mime_type:   (file.type || 'application/octet-stream').slice(0, 128),
+        size_bytes:  file.size,
+        sha256,
+        content_b64: b64,
+      });
+    } catch (err) {
+      console.error('attachment encode error:', err);
+    }
+  }
+  $fileInput.value = '';
+  renderAttachPreview();
+});
+
+function renderAttachPreview() {
+  $attachPreview.innerHTML = '';
+  for (let i = 0; i < pendingAtts.length; i++) {
+    const a   = pendingAtts[i];
+    const el  = document.createElement('span');
+    el.className = 'attach-chip-small';
+    el.title     = `sha256: ${a.sha256}\nsize: ${a.size_bytes} bytes`;
+    el.textContent = `${a.filename} (${formatBytes(a.size_bytes)}) ✕`;
+    const idx = i;
+    el.addEventListener('click', () => {
+      pendingAtts.splice(idx, 1);
+      renderAttachPreview();
+    });
+    $attachPreview.appendChild(el);
+  }
+}
+
+async function computeSha256Hex(u8) {
+  const hash   = await crypto.subtle.digest('SHA-256', u8);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function uint8ToBase64(u8) {
+  let bin = '';
+  for (const b of u8) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+function formatBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
 
 // ── channel management ────────────────────────────────────────────────────────
@@ -662,20 +1010,45 @@ async function sendMsg() {
   }
   $sendBtn.disabled = true;
   try {
-    const signing = _keypair ? signMessage(text, activeChannel) : {};
-    const payload = {
-      content:     text,
-      author:      myName,
-      author_name: myName,
-      channel:     activeChannel,
-      ...signing,
-    };
-    await fetch(`${BASE}messages?channel=${encodeURIComponent(activeChannel)}`, {
+    let payload;
+
+    if (hasV11Identity()) {
+      // v1.1 DOT-native: sign with cell key
+      const atts = [...pendingAtts];
+      const signed = signMessageV11(text, activeChannel, atts);
+      payload = {
+        ...signed,
+        author:      myName,
+        author_name: myName,
+      };
+    } else {
+      // v1.0 legacy: sign with browser keypair
+      const signing = _keypair ? signMessage(text, activeChannel) : {};
+      payload = {
+        content:     text,
+        author:      myName,
+        author_name: myName,
+        channel:     activeChannel,
+        ...signing,
+      };
+    }
+
+    const resp = await fetch(`${BASE}messages?channel=${encodeURIComponent(activeChannel)}`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(payload),
     });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      console.error('send rejected:', err.error);
+      alert(`Send failed: ${err.error}`);
+      return;
+    }
+
     $msgInput.value = '';
+    pendingAtts = [];
+    renderAttachPreview();
     $msgInput.focus();
   } catch (err) {
     console.error('send failed:', err);
@@ -702,7 +1075,9 @@ function renderMsg(msg) {
   $empty.style.display = 'none';
 
   const myPk  = pubkeyHex();
-  const isOwn = (myPk && msg.pubkey === myPk) || (msg.author === myName);
+  const isOwn = (myPk && msg.pubkey === myPk) ||
+                (_dot1 && msg.from_dot1 === _dot1) ||
+                (msg.author === myName);
 
   const el = document.createElement('div');
   el.className = 'msg' + (isOwn ? ' own' : '');
@@ -711,11 +1086,25 @@ function renderMsg(msg) {
     hour: '2-digit', minute: '2-digit', hour12: false,
   });
 
+  // Determine identity badge
+  let identityBadge = '';
+  if (msg.version === '1.1' && msg.from_dot1) {
+    // v1.1 DOT-native: show dot1 short form + sig verification
+    const dot1Short = msg.from_dot1.replace('dot1:', '').slice(-6);
+    const verified  = verifyMessageV11(msg);
+    const sigBadge  = verified
+      ? `<span class="sig-ok" title="signature verified">✓ ${esc(dot1Short)}</span>`
+      : `<span class="sig-none" title="signature not verified">? ${esc(dot1Short)}</span>`;
+    identityBadge = sigBadge;
+  } else if (msg.pubkeyShort) {
+    identityBadge = `<span class="pubkey-tag">${esc(msg.pubkeyShort)}</span>`;
+  } else if (msg.unsigned || msg.legacy) {
+    identityBadge = `<span class="legacy-tag">unsigned</span>`;
+  }
+
   const authorMeta = `<span class="msg-author">
     ${esc(msg.author_name || msg.author)}
-    ${msg.pubkeyShort
-      ? `<span class="pubkey-tag">${esc(msg.pubkeyShort)}</span>`
-      : (msg.legacy ? `<span class="legacy-tag">unsigned</span>` : '')}
+    ${identityBadge}
   </span>`;
 
   el.innerHTML =
@@ -723,6 +1112,22 @@ function renderMsg(msg) {
     `<div class="msg-text"></div>`;
 
   el.querySelector('.msg-text').textContent = msg.content;
+
+  // Render attachment chips
+  if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
+    const attEl = document.createElement('div');
+    attEl.className = 'attachments';
+    for (const a of msg.attachments) {
+      const chip = document.createElement('div');
+      chip.className = 'att-chip';
+      chip.title     = `sha256: ${a.sha256}`;
+      chip.innerHTML = `<span class="att-name">${esc(a.filename)}</span>` +
+                       `<span class="att-size">${formatBytes(a.size_bytes)}</span>`;
+      attEl.appendChild(chip);
+    }
+    el.appendChild(attEl);
+  }
+
   $msgs.appendChild(el);
   $msgs.scrollTop = $msgs.scrollHeight;
 
@@ -823,6 +1228,7 @@ window.addEventListener('hashchange', () => {
 // ── init ──────────────────────────────────────────────────────────────────────
 (async () => {
   await loadOrCreateKeypair();
+  updateKeyBanner();
 
   const hashCh = parseHashChannel();
   if (hashCh) { activeChannel = hashCh; $activeChBadge.textContent = hashCh; }

@@ -1,8 +1,121 @@
-# piper-chat wire format
+# piper-chat wire format — v1.1
 
-## message object
+## Overview
+
+piper-chat supports two wire-format versions:
+
+| Version | Description | Status |
+|---------|-------------|--------|
+| `1.0` | Legacy unsigned or browser-keypair-signed messages | **Accepted on receive, deprecated on send** |
+| `1.1` | DOT-native: ed25519-signed, dot1 sender identity, DOTpost v1.3 attachments | **Current** |
+
+v1.0 messages are accepted at receive time and stored with `unsigned: true`. New outgoing messages MUST be v1.1 (signed). Unsigned v1.0 messages are marked in the UI with a warning badge.
+
+---
+
+## v1.1 message object
 
 Every message posted via `POST /messages` or received via `GET /events` is a JSON object:
+
+```json
+{
+  "id":               "<uuid-v4>",
+  "version":          "1.1",
+  "content":          "<UTF-8 text, max 4096 bytes>",
+  "channel":          "<channel name, default 'main', max 32 chars>",
+  "createdAt":        "<ISO 8601 timestamp>",
+  "prev":             "<16-hex prev hash | null>",
+
+  "from_dot1":        "<dot1:[0-9a-f]{16}>",
+  "from_ed25519_pub": "<64-hex ed25519 public key>",
+  "sig":              "<128-hex ed25519 signature>",
+
+  "attachments": [
+    {
+      "filename":    "<string, max 256 chars>",
+      "mime_type":   "<string, max 128 chars>",
+      "size_bytes":  "<integer>",
+      "sha256":      "<64-hex SHA-256 of the raw file bytes>",
+      "content_b64": "<base64-encoded file content>"
+    }
+  ]
+}
+```
+
+- `from_dot1` — the sender's sovereign cell address. Format: `dot1:` followed by 16 lowercase hex characters.
+- `from_ed25519_pub` — the sender's ed25519 public key, 64 lowercase hex characters (32 bytes).
+- `sig` — detached ed25519 signature, 128 lowercase hex characters (64 bytes). Covers a canonical form of the message (see §Signature canonical form below).
+- `attachments` — array of DOTpost v1.3 attachment objects. Max 32 per message. Empty array if no attachments. Server drops invalid items (field missing, out-of-range, non-base64) rather than rejecting the whole message. `content_b64` is included in the `POST /messages` response but stripped from SSE broadcasts and `GET /messages` list responses (metadata-only in lists).
+- `prev` — 16-hex prefix of `SHA-256(last_message.id + last_message.content)`, or null for the first message in a channel. Not a cryptographic proof — a lightweight ordering hint.
+
+---
+
+## §Signature canonical form
+
+The `sig` field covers the following bytes:
+
+```
+canonical_json_without_sig_and_content_b64 + "::" + attachment_manifest_json
+```
+
+Where:
+
+**`canonical_json_without_sig_and_content_b64`** is `JSON.stringify` of the message object with:
+- `sig` field removed entirely
+- `content_b64` stripped from each attachment (only attachment metadata is signed)
+- keys sorted alphabetically (A-Z)
+- no extra whitespace
+
+The signed fields are: `channel`, `content`, `createdAt`, `from_dot1`, `from_ed25519_pub`, `id`, `prev`, `version`.
+
+**`attachment_manifest_json`** is `JSON.stringify` of the attachments array with each item reduced to `{filename, mime_type, sha256, size_bytes}` (no `content_b64`), in the same order as the `attachments` array:
+
+```json
+[{"filename":"spec.md","mime_type":"text/markdown","sha256":"abc123...","size_bytes":53083}]
+```
+
+If there are no attachments, `attachment_manifest_json` is `[]`.
+
+### Example canonical signing input
+
+```
+{"channel":"main","content":"hello v1.1","createdAt":"2026-05-12T00:00:00.000Z","from_dot1":"dot1:6d94e2c24a06486b","from_ed25519_pub":"27307d...","id":"uuid-here","prev":null,"version":"1.1"}::[{"filename":"spec.md","mime_type":"text/markdown","sha256":"abc...","size_bytes":53083}]
+```
+
+### Verification algorithm
+
+```
+msg_bytes = UTF-8(canonical_signing_input)
+sig_bytes = hex_decode(msg.sig)          // 64 bytes
+pub_bytes = hex_decode(msg.from_ed25519_pub) // 32 bytes
+valid     = ed25519.verify_detached(msg_bytes, sig_bytes, pub_bytes)
+```
+
+Using tweetnacl: `nacl.sign.detached.verify(msg_bytes, sig_bytes, pub_bytes)`
+
+---
+
+## §Sender identity binding (dot1 ↔ ed25519_pub)
+
+`from_dot1` is defined as `sha256(secp256k1_leaf_pubkey_compressed_bytes).hex()[:16]` per the DOT protocol specification, where the leaf pubkey is derived from the sender's cell via a BIP-32 path tokenized from the canonical section of their cell file.
+
+**v1.1 does NOT verify this binding on receipt.** Verifying it would require BIP-32 derivation in the browser, which is out of scope for this version.
+
+**Client trust-on-first-use:** The server verifies only the ed25519 signature (that the message was signed by the key claiming to be `from_ed25519_pub`). The dot1↔pubkey binding is asserted by the sender and trusted by the recipient. Challenge-response verification of the binding is planned for v1.2.
+
+**This is an intentional design choice, not a security hole:** piper-chat is public plaintext chat. Sender identity is intentionally visible. This is distinct from the Audit-Carol sealed-sender finding (which applies to private encrypted messaging where the sender identity must be hidden). In piper-chat, the sender's address and pubkey are part of the public message — there is no anonymity set to protect, and no need to hide sender identity inside an encrypted envelope.
+
+---
+
+## §Backwards compatibility (v1.0 → v1.1)
+
+- **Receive:** Server accepts v1.0 messages (no `from_dot1`, no `sig`, plain `author` string). They are stored with `unsigned_legacy: 1` and surfaced via SSE with `unsigned: true` in the public message object. The UI shows a warning badge.
+- **Send:** New messages from updated clients MUST be v1.1 (signed). v1.0 unsigned sends are logged to telemetry (`unsigned_message_posted`) and accepted only for backwards compat during the transition window. The transition window closes with v1.2.
+- **Field presence:** v1.0 clients receiving v1.1 messages will ignore unknown fields (`from_dot1`, `from_ed25519_pub`, `sig`, `attachments`) — JSON forwards-compat by design.
+
+---
+
+## v1.0 (legacy) message object
 
 ```json
 {
@@ -11,23 +124,33 @@ Every message posted via `POST /messages` or received via `GET /events` is a JSO
   "author":    "<display name, max 64 chars>",
   "channel":   "<channel name, default 'main', max 32 chars>",
   "createdAt": "<ISO 8601 timestamp>",
-  "prev":      "<16-hex-char prefix of SHA-256(JSON.stringify(previous_message)) | null>"
+  "prev":      "<16-hex-char SHA-256 prefix | null>"
 }
 ```
 
-`prev` is null for the first message. It is not a cryptographic proof of integrity — it is a lightweight ordering hint that makes accidental reordering visible.
+v1.0 signing (if present):
+- `pubkey` — 64-hex ed25519 public key
+- `signature` — 128-hex ed25519 signature
+- `signed_at` — ms epoch timestamp
+
+v1.0 canonical signing string: `"v1\n<pubkey>\n<channel>\n<signed_at>\n<content>"`
+
+---
 
 ## endpoints
 
-| method | path        | description                                     |
-|--------|-------------|-------------------------------------------------|
-| GET    | /           | chat UI (index.html)                            |
-| GET    | /health     | node status JSON                                |
-| GET    | /events     | SSE stream — replays history then live updates  |
-| POST   | /messages   | post a message (`{content, author, channel}`)   |
-| GET    | /messages   | fetch history (`?limit=N&since=<id>`)           |
-| GET    | /ticket     | get iroh doc share ticket (if iroh is running)  |
-| POST   | /connect    | connect to peer (`{ticket: "<iroh-ticket>"}`)   |
+| method | path        | description                                                    |
+|--------|-------------|----------------------------------------------------------------|
+| GET    | /           | chat UI (index.html)                                           |
+| GET    | /health     | node status JSON (`protocol_version: "1.1"`)                  |
+| GET    | /events     | SSE stream — replays history then live updates (`?channel=X`) |
+| POST   | /messages   | post a message (v1.1 or v1.0 body)                            |
+| GET    | /messages   | fetch history (`?channel=X&limit=N&since=<ISO>`)              |
+| GET    | /channels   | list all channels                                              |
+| GET    | /ticket     | get iroh doc share ticket (if iroh is running)                 |
+| POST   | /connect    | connect to peer (`{ticket: "<iroh-ticket>"}`)                  |
+
+---
 
 ## iroh sync model
 
@@ -35,24 +158,48 @@ When iroh is available, each message is also written to the iroh document as a k
 
 - **key**: `message.id` (UTF-8 bytes)
 - **value**: `JSON.stringify(message)` (UTF-8 bytes)
-- **author**: the iroh node's default author key
 
-iroh replicates document entries to all connected peers. The iroh document is not authoritative — the in-memory `messages` array is. iroh adds eventual-consistency sync across nodes; the SSE stream handles real-time delivery within a single node's connected browsers.
+iroh replicates document entries to all connected peers. iroh adds eventual-consistency sync across nodes; SSE handles real-time delivery within a node's connected clients.
+
+---
 
 ## rate limiting
 
-- 30 messages per minute per source IP
+- 30 signed messages per minute per public key (v1.1: per ed25519 pubkey; v1.0: per pubkey field)
+- 30 messages per minute per source IP (unsigned legacy posts)
+- Global flood guard: 100 messages/sec server-wide → 503
 - 4096-byte content limit
 - 64-char author name limit
-- Simple dedup: same author + content within 10 seconds → returns existing message, no duplicate stored
+- Dedup: same pubkey + content within 10 seconds in the same channel → returns existing message
+
+---
 
 ## storage
 
-Messages are persisted to `data/messages.json` on disk (configurable via `DATA_DIR` env var). The file is written synchronously after each accepted message. On server restart, history is loaded and replayed to new SSE subscribers.
+Messages are persisted to a SQLite database at `data/piperchat.db` (configurable via `DATA_DIR` and `DB_PATH` env vars). Legacy JSON migration from `data/messages.json` is performed automatically on first start if the database is empty.
+
+v1.1-specific columns added to the `messages` table:
+- `from_dot1 TEXT` — sender's dot1 address
+- `from_ed25519_pub TEXT` — sender's ed25519 public key
+- `sig TEXT` — detached signature (v1.1)
+- `signed INTEGER DEFAULT 0` — 1 if v1.1 signed
+- `unsigned_legacy INTEGER DEFAULT 0` — 1 if no signature (v1.0 unsigned)
+- `attachments_json TEXT` — JSON-serialised attachments array (full, including content_b64)
+
+---
 
 ## constraints
 
-- No authentication. Any client that can reach the HTTP server can post messages.
-- No end-to-end encryption. Messages are plain text in transit and at rest.
+- Public plaintext chat. Messages are plain text in transit and at rest. No end-to-end encryption (see v1.2 roadmap for AES-256-GCM encrypted bodies).
 - No message deletion. The append-only chain is intentional.
-- iroh P2P connectivity depends on NAT traversal. Connections behind strict symmetric NAT may fall back to relay mode automatically via iroh's built-in relay nodes.
+- Sender identity is intentionally public. This is NOT sealed-sender architecture.
+- `ed25519_priv_hex` is stored only in `sessionStorage` in the browser client — never in `localStorage`, never sent to the server.
+- iroh P2P connectivity depends on NAT traversal. Behind strict symmetric NAT, falls back to relay mode.
+
+---
+
+## v1.2 roadmap (out of scope for v1.1)
+
+- AES-256-GCM encrypted message bodies (sealed body; key exchanged via X25519)
+- Challenge-response dot1↔pubkey binding verification (closes the TOFU gap)
+- DiffBundle outer envelope (BLAKE3 ancestry + four-vector continuous diff)

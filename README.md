@@ -1,5 +1,7 @@
 # piperchat
 
+**v1.1 — DOT-native** | ed25519-signed identities, dot1 addresses, DOTpost v1.3 attachments
+
 A minimal P2P chat node. Two browsers, one message, no server in the middle that owns your data. Each node holds its own message history. Peers sync documents directly using [iroh](https://github.com/n0-computer/iroh) — a Rust-based P2P document layer that works across NAT without a relay you don't control. When iroh is unavailable (firewalled network, CI), the server falls back to SSE relay mode and chat still works.
 
 No accounts. No telemetry. No external services required to start.
@@ -28,6 +30,54 @@ Each running instance is a node. Nodes exchange messages two ways:
 Messages are appended locally to `data/messages.json`. Each message records the SHA-256 prefix of the previous message, forming a lightweight hash chain.
 
 See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the wire format.
+
+## v1.1 — DOT-native
+
+v1.1 upgrades every message to a signed, identity-bound object. The sender carries a `dot1:` address (derived from their sovereign cell) and an ed25519 keypair. Every message is signed before it hits the server; bad signatures are rejected 400. Unsigned v1.0 messages are still accepted (backwards compat) but flagged in the UI.
+
+### what changed in v1.1
+
+- **Sender identity:** `author` string replaced by `from_dot1` (16-hex cell address) + `from_ed25519_pub` (64-hex pubkey). The dot1 short form is shown in the UI next to each message.
+- **Signatures:** Every outgoing message carries `sig` — a detached ed25519 signature over a canonical form of the message metadata + attachment manifest. The server verifies on POST; the browser verifies on SSE receive. Bad sigs → 400.
+- **Attachments (DOTpost v1.3):** Messages can carry up to 32 file attachments. Each attachment has `{filename, mime_type, size_bytes, sha256, content_b64}`. The server validates structure on POST, drops invalid items. SHA-256 hashes are included in the signature so attachment content is bound to the message.
+- **UI:** A key setup banner prompts you to paste your `ed25519_priv_hex` (session-only, `sessionStorage` only, never sent to server). A 📎 button lets you attach up to 4 files (≤ 1 MB each). Messages show a `✓ dot1short` badge (verified) or `? dot1short` (unverified / v1.0).
+
+### sending a v1.1 message via curl
+
+First build the signing input (see docs/PROTOCOL.md §Signature canonical form). Here's the quick version using the Node client:
+
+```bash
+node -e "
+const { PiperClient } = require('./client');
+const c = new PiperClient({
+  url: 'http://localhost:4100',
+  author: 'Kin-1-Piper',
+  dot1: 'dot1:6d94e2c24a06486b',
+  ed25519PubHex: '27307d0731ab61630777f511581d4e47cf57df9c7b1bd65e5c989888523790cd',
+  ed25519PrivHex: process.env.PIPER_PRIV_HEX,
+});
+c.send('hello v1.1').then(r => console.log(JSON.stringify(r, null, 2)));
+"
+```
+
+Set `PIPER_PRIV_HEX` to your 128-hex ed25519 private key (seed + public key concatenated). The server verifies the signature on every POST.
+
+### pointing the Node client at a cell file
+
+```js
+const { PiperClient } = require('./client');
+
+const c = new PiperClient({
+  url:           'http://localhost:4100',
+  author:        'Kin-1-Piper',
+  cellPath:      '/path/to/cell_Kin-1-Piper.md', // reads dot1 + ed25519_pub from PUBKEYS section
+  ed25519PrivHex: process.env.PIPER_PRIV_HEX,    // priv is never stored in the cell file
+});
+
+await c.send('hello from a cell');
+```
+
+See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full wire format.
 
 ## use it from code
 
