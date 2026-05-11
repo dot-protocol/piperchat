@@ -23,6 +23,7 @@ const db         = require('./lib/db');
 const {
   verifyMessage, isSigned,
   isV11Signed, verifyMessageV11, validateAttachments,
+  isV12Envelope, verifyV12Envelope,
 } = require('./lib/crypto');
 const { checkFlood, checkPubkey, checkIp } = require('./lib/ratelimit');
 const { capture } = require('./lib/telemetry');
@@ -150,10 +151,11 @@ function corsHeaders(req) {
 
 // ── build a public message object from a db row ───────────────────────────────
 function toPublic(row) {
+  const isV12 = Boolean(row.encrypted);
   const base = {
     id:          row.id,
     channel:     row.channel,
-    version:     row.from_dot1 ? '1.1' : '1.0',
+    version:     isV12 ? '1.2' : (row.from_dot1 ? '1.1' : '1.0'),
     // v1.0 backwards-compat fields
     author:      row.author_name,
     author_name: row.author_name,
@@ -165,15 +167,28 @@ function toPublic(row) {
     legacy:      Boolean(row.legacy),
     signed:      Boolean(row.signature) || Boolean(row.signed),
     unsigned:    Boolean(row.unsigned_legacy),
+    encrypted:   isV12,
   };
 
-  // v1.1 DOT-native fields (present only on v1.1 messages)
+  // v1.1 DOT-native fields (present on v1.1 and v1.2 messages)
   if (row.from_dot1) {
     base.from_dot1        = row.from_dot1;
     base.from_ed25519_pub = row.from_ed25519_pub;
     // dot1 short form: last 6 hex chars of the 16-char address suffix
     base.dot1Short        = row.from_dot1.replace('dot1:', '').slice(-6);
     base.sig              = row.sig;
+  }
+
+  // v1.2 E2E encryption fields (only on encrypted messages)
+  if (isV12) {
+    base.from_x25519_pub = row.from_x25519_pub || null;
+    base.cipher_body     = row.cipher_body     || null;
+    // Decode wraps from stored JSON string back to array
+    if (row.wraps_json) {
+      try { base.wraps = JSON.parse(row.wraps_json); } catch (_) { base.wraps = []; }
+    } else {
+      base.wraps = [];
+    }
   }
 
   // Attachments — decode from JSON string, strip content_b64 for SSE/GET responses
@@ -270,8 +285,9 @@ const server = http.createServer(async (req, res) => {
       messages:         db.countMessages(),
       keys:             db.countKeys(),
       uptime_s:         Math.floor(uptime),
-      version:          '1.1.0',
-      protocol_version: '1.1',
+      version:          '1.2.0',
+      protocol_version: '1.2',
+      protocol_versions_supported: ['1.0', '1.1', '1.2'],
     }));
     return;
   }
@@ -305,7 +321,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     const content = sanitize(body.content || '');
-    if (!content) {
+    // v1.2 envelopes carry the body inside cipher_body; content field is optional for them.
+    const isV12Request = body.version === '1.2' || (body.cipher_body !== undefined && body.wraps !== undefined);
+    if (!content && !isV12Request) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'content required' }));
       return;
@@ -316,14 +334,16 @@ const server = http.createServer(async (req, res) => {
     let from_dot1 = null, from_ed25519_pub = null, sig_v11 = null, signed_v11 = 0;
     let unsigned_legacy = 0;
     let attachments_json = null;
-    // v1.1: use client-provided id/createdAt (signed over them); v1.0: server-generated
+    // v1.2 E2E encryption fields
+    let from_x25519_pub = null, cipher_body = null, wraps_json = null, encrypted = 0;
+    // v1.1/v1.2: use client-provided id/createdAt (signed over them); v1.0: server-generated
     let msg_id         = randomUUID();
     let msg_created_at = new Date().toISOString();
 
     // Pre-check: partial v1.0 signing fields (has some but not all).
     // Handled before the three-way branch to give a precise error message.
     const looksLikeV10 = (body.pubkey || body.signature || body.signed_at !== undefined) &&
-                         body.version !== '1.1' && !body.from_dot1;
+                         body.version !== '1.1' && body.version !== '1.2' && !body.from_dot1;
     if (looksLikeV10 && !isSigned(body)) {
       const problems = [];
       if (typeof body.pubkey    !== 'string' || body.pubkey.length    !== 64)  problems.push(`pubkey must be 64 hex chars (got ${typeof body.pubkey === 'string' ? body.pubkey.length : typeof body.pubkey})`);
@@ -334,8 +354,123 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ── v1.2 E2E encrypted envelope path ─────────────────────────────────────
+    if (body.version === '1.2' || (body.cipher_body !== undefined && body.wraps !== undefined)) {
+
+      // Validate required v1.2 structure
+      const v12problems = [];
+      if (!body.from_dot1 || !/^dot1:[0-9a-f]{16}$/.test(body.from_dot1))
+        v12problems.push('from_dot1 must match dot1:[0-9a-f]{16}');
+      if (typeof body.from_ed25519_pub !== 'string' || body.from_ed25519_pub.length !== 64)
+        v12problems.push('from_ed25519_pub must be 64 hex chars');
+      if (typeof body.from_x25519_pub !== 'string' || body.from_x25519_pub.length !== 64)
+        v12problems.push('from_x25519_pub must be 64 hex chars');
+      if (typeof body.cipher_body !== 'string' || body.cipher_body.length === 0)
+        v12problems.push('cipher_body must be a non-empty base64 string');
+      if (!Array.isArray(body.wraps) || body.wraps.length < 1)
+        v12problems.push('wraps must be a non-empty array');
+      if (typeof body.sig !== 'string' || body.sig.length !== 128)
+        v12problems.push('sig must be 128 hex chars');
+
+      if (v12problems.length > 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `malformed v1.2 envelope: ${v12problems.join('; ')}` }));
+        return;
+      }
+
+      // Validate cipher_body is valid base64 and has min length (12 nonce + 16 tag = 28 bytes)
+      let cipherBuf;
+      try {
+        cipherBuf = Buffer.from(body.cipher_body, 'base64');
+      } catch (_) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'v1.2: cipher_body is not valid base64' }));
+        return;
+      }
+      if (cipherBuf.length < 28) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `v1.2: cipher_body too short (${cipherBuf.length} bytes, min 28)` }));
+        return;
+      }
+
+      // Validate each wrap entry
+      for (const wrap of body.wraps) {
+        if (!wrap || typeof wrap !== 'object') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'v1.2: each wrap must be an object' }));
+          return;
+        }
+        if (!/^dot1:[0-9a-f]{16}$/.test(wrap.recipient_dot1 || '')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `v1.2: wrap.recipient_dot1 invalid: ${wrap.recipient_dot1}` }));
+          return;
+        }
+        try {
+          const wrapBuf = Buffer.from(wrap.wrapped_body_key || '', 'base64');
+          if (wrapBuf.length < 60) throw new Error('too short');
+        } catch (_) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `v1.2: wrap.wrapped_body_key invalid for ${wrap.recipient_dot1}` }));
+          return;
+        }
+      }
+
+      // Validate attachments (metadata only — same as v1.1)
+      const atts = validateAttachments(body.attachments);
+
+      // Server-side sig verification (server does NOT decrypt — just verifies authenticity)
+      const clientId        = (typeof body.id === 'string' && body.id.length > 0) ? body.id : randomUUID();
+      const clientCreatedAt = (typeof body.createdAt === 'string' && body.createdAt.length > 0)
+        ? body.createdAt : new Date().toISOString();
+
+      const envForVerify = {
+        id:               clientId,
+        version:          '1.2',
+        channel,
+        createdAt:        clientCreatedAt,
+        prev:             body.prev !== undefined ? body.prev : null,
+        from_dot1:        body.from_dot1,
+        from_ed25519_pub: body.from_ed25519_pub,
+        from_x25519_pub:  body.from_x25519_pub,
+        cipher_body:      body.cipher_body,
+        wraps:            body.wraps,
+        sig:              body.sig,
+      };
+
+      const check = verifyV12Envelope(envForVerify, atts);
+      if (!check.ok) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `v1.2 signature rejected: ${check.reason}` }));
+        return;
+      }
+
+      // per-pubkey rate limit
+      if (!checkPubkey(body.from_ed25519_pub)) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+        res.end(JSON.stringify({ error: 'rate limit: 30 signed messages per minute' }));
+        return;
+      }
+
+      // Server stores the envelope as-is. content field is set to
+      // '[encrypted v1.2 message — upgrade client]' for legacy clients.
+      author_pubkey    = body.from_ed25519_pub;
+      author_name      = sanitize(body.author_name || body.author || body.from_dot1, MAX_AUTHOR_BYTES);
+      from_dot1        = body.from_dot1;
+      from_ed25519_pub = body.from_ed25519_pub;
+      from_x25519_pub  = body.from_x25519_pub;
+      sig_v11          = body.sig;
+      signed_v11       = 1;
+      cipher_body      = body.cipher_body;
+      wraps_json       = JSON.stringify(body.wraps);
+      encrypted        = 1;
+      if (atts.length > 0) attachments_json = JSON.stringify(atts);
+      msg_id         = clientId;
+      msg_created_at = clientCreatedAt;
+
+      // Telemetry + build row + store + broadcast (falls through to common store path below)
+
+    } else if (body.version === '1.1' || isV11Signed(body)) {
     // ── v1.1 DOT-native path ──────────────────────────────────────────────────
-    if (body.version === '1.1' || isV11Signed(body)) {
 
       // Detect partial v1.1 (has version="1.1" or from_dot1 but missing sig fields)
       if (!isV11Signed(body)) {
@@ -443,12 +578,16 @@ const server = http.createServer(async (req, res) => {
       ? createHash('sha256').update(last.id + last.content).digest('hex').slice(0, 16)
       : null;
 
+    // For v1.2 encrypted messages, the stored `content` is a placeholder for legacy clients.
+    // The real plaintext is inside cipher_body and never touches the server in plaintext.
+    const storedContent = encrypted ? '[encrypted v1.2 message — upgrade client]' : content;
+
     const newRow = {
       id:              msg_id,
       channel,
       author_pubkey,
       author_name,
-      content,
+      content:         storedContent,
       created_at:      msg_created_at,
       prev_hash,
       signature,
@@ -461,14 +600,22 @@ const server = http.createServer(async (req, res) => {
       signed:          signed_v11,
       unsigned_legacy,
       attachments_json,
+      // v1.2 fields
+      from_x25519_pub,
+      cipher_body,
+      wraps_json,
+      encrypted,
     };
 
-    // dedup: same pubkey + content within 10 seconds in this channel
+    // dedup: same pubkey + id within 10 seconds in this channel.
+    // For v1.2 we key on id (client-generated) rather than content (which is an opaque blob).
     const recent = db.getMessages({ channel, limit: 10 });
     const dup = recent.find(m =>
-      m.author_pubkey === author_pubkey &&
-      m.content       === content &&
-      Date.now() - new Date(m.created_at).getTime() < 10_000
+      encrypted
+        ? m.id === msg_id   // v1.2: dedup by id
+        : (m.author_pubkey === author_pubkey &&
+           m.content       === storedContent &&
+           Date.now() - new Date(m.created_at).getTime() < 10_000)
     );
     if (dup) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -484,12 +631,14 @@ const server = http.createServer(async (req, res) => {
     writeToIroh(pub);
 
     // telemetry
+    const msgVersion = encrypted ? '1.2' : (from_dot1 ? '1.1' : '1.0');
     capture('message_posted', {
       channel,
-      pubkey:  author_pubkey,
-      legacy:  Boolean(legacy),
-      version: from_dot1 ? '1.1' : '1.0',
-      signed:  Boolean(signed_v11 || signature),
+      pubkey:    author_pubkey,
+      legacy:    Boolean(legacy),
+      version:   msgVersion,
+      signed:    Boolean(signed_v11 || signature),
+      encrypted: Boolean(encrypted),
     });
     if (!legacy && author_pubkey && !recent.some(m => m.author_pubkey === author_pubkey)) {
       capture('key_first_seen', { pubkey: author_pubkey });
