@@ -15,8 +15,9 @@
 'use strict';
 
 // PiperClient — thin Node.js wrapper around piper-chat's HTTP + SSE API.
-// Supports both v1.0 (legacy) and v1.1 (DOT-native, ed25519-signed) message formats.
-// Zero external dependencies beyond those already in package.json. Node 20+ built-ins only.
+// Supports v1.0 (legacy), v1.1 (DOT-native signed), and v1.2 (sealed body E2E encrypted)
+// message formats. Zero external dependencies beyond those already in package.json.
+// Node 20+ built-ins only.
 
 const http        = require('http');
 const https       = require('https');
@@ -24,7 +25,17 @@ const fs          = require('fs');
 const { randomUUID, createHash } = require('crypto');
 
 // v1.1 crypto helpers (require tweetnacl from package.json)
-const { signMessageV11, verifyMessageV11, validateAttachments } = require('./lib/crypto');
+const { signMessageV11, verifyMessageV11, validateAttachments,
+        isV12Envelope, signV12Envelope, verifyV12Envelope } = require('./lib/crypto');
+
+// v1.2 sealed-body crypto (X25519 + AES-256-GCM, no new deps)
+const {
+  generateBodyKey, encryptBody, decryptBody,
+  wrapBodyKey, unwrapBodyKey,
+} = require('./lib/sealed-body');
+
+// v1.2 mailbox relay bridge (no new deps)
+const { pushEnvelope, pullEnvelopes } = require('./lib/mailbox-bridge');
 
 const DEFAULT_URL     = 'http://localhost:4101';
 const DEFAULT_CHANNEL = 'main';
@@ -79,9 +90,16 @@ class PiperClient {
    * @param {string}  [opts.ed25519PubHex]    - 64-hex ed25519 public key
    * @param {string}  [opts.ed25519PrivHex]   - 128-hex ed25519 private key (seed+pub concatenated)
    *                                            If provided, all outgoing messages are v1.1-signed.
-   * @param {string}  [opts.cellPath]         - Path to a cell_*.md file. If given, ed25519PubHex
-   *                                            and dot1 are read from the file's PUBKEYS section.
-   *                                            ed25519PrivHex must still be supplied separately.
+   *
+   * v1.2 identity options (sealed body E2E encryption):
+   * @param {string}  [opts.x25519PubHex]     - 64-hex X25519 raw public key (DH)
+   * @param {string}  [opts.x25519PrivHex]    - 64-hex X25519 raw private key (seed)
+   *                                            If provided, sendEncrypted() is available.
+   *
+   * @param {string}  [opts.cellPath]         - Path to a cell_*.md file. If given, ed25519PubHex,
+   *                                            x25519PubHex, and dot1 are read from the file's
+   *                                            PUBKEYS section. Private keys must still be
+   *                                            supplied separately.
    */
   constructor(opts = {}) {
     this.author     = opts.author || 'anonymous';
@@ -90,18 +108,31 @@ class PiperClient {
     this.includeOwn = Boolean(opts.includeOwn);
 
     // v1.1 identity
-    this._dot1    = opts.dot1    || null;
+    this._dot1        = opts.dot1        || null;
     this._ed25519Pub  = opts.ed25519PubHex  || null;
     this._ed25519Priv = opts.ed25519PrivHex || null;
 
-    // Load pub+dot1 from cell file if provided (priv must still be supplied separately)
+    // v1.2 identity (X25519 key pair for E2E encryption)
+    this._x25519Pub  = opts.x25519PubHex  || null;
+    this._x25519Priv = opts.x25519PrivHex || null;
+
+    // Load pub keys + dot1 from cell file if provided (priv keys supplied separately)
     if (opts.cellPath) {
       const parsed = parseCellFile(opts.cellPath);
       if (parsed) {
         if (!this._ed25519Pub && parsed.ed25519_pub) this._ed25519Pub = parsed.ed25519_pub;
+        if (!this._x25519Pub  && parsed.x25519_pub)  this._x25519Pub  = parsed.x25519_pub;
         if (!this._dot1 && parsed.dot1) this._dot1 = parsed.dot1;
       }
     }
+
+    // Per-channel recipient registries for v1.2 group chat:
+    // Map<channel, Array<{recipient_dot1, x25519_pub_hex}>>
+    this._roomRecipients = new Map();
+
+    // Mailbox cursor: last sequence number successfully pulled from the relay.
+    // Map<dot1, number>
+    this._mailboxCursor = new Map();
 
     this._handlers   = new Set();   // subscribe() callbacks
     this._sseReq     = null;        // active http.ClientRequest
@@ -113,6 +144,12 @@ class PiperClient {
   /** Returns true if this client has a v1.1 signing identity configured. */
   get canSignV11() {
     return Boolean(this._ed25519Priv && this._ed25519Pub && this._dot1);
+  }
+
+  /** Returns true if this client has a v1.2 E2E encryption identity configured. */
+  get canEncryptV12() {
+    return Boolean(this._ed25519Priv && this._ed25519Pub && this._dot1 &&
+                   this._x25519Priv && this._x25519Pub);
   }
 
   // ── public API ──────────────────────────────────────────────────────────────
@@ -177,6 +214,220 @@ class PiperClient {
     this._disconnectSSE();
   }
 
+  // ── v1.2 public API ──────────────────────────────────────────────────────────
+
+  /**
+   * Register a recipient for encrypted group chat on a channel.
+   * Recipients are stored per-channel and used when sendEncrypted() is called.
+   *
+   * @param {string} channel        - Channel name
+   * @param {object} recipient
+   * @param {string} recipient.dot1          - recipient's dot1 address
+   * @param {string} recipient.x25519PubHex  - recipient's 64-hex X25519 public key
+   */
+  addRoomRecipient(channel, { dot1, x25519PubHex }) {
+    if (typeof dot1 !== 'string' || !/^dot1:[0-9a-f]{16}$/.test(dot1)) {
+      throw new TypeError('addRoomRecipient: dot1 must match dot1:[0-9a-f]{16}');
+    }
+    if (typeof x25519PubHex !== 'string' || x25519PubHex.length !== 64) {
+      throw new TypeError('addRoomRecipient: x25519PubHex must be 64 hex chars');
+    }
+    if (!this._roomRecipients.has(channel)) this._roomRecipients.set(channel, []);
+    const list = this._roomRecipients.get(channel);
+    // Upsert: replace if same dot1 already present
+    const idx = list.findIndex(r => r.dot1 === dot1);
+    if (idx >= 0) list[idx] = { dot1, x25519PubHex };
+    else list.push({ dot1, x25519PubHex });
+  }
+
+  /**
+   * Remove a recipient from the channel's recipient list.
+   * @param {string} channel - Channel name
+   * @param {string} dot1    - Recipient's dot1 to remove
+   */
+  removeRoomRecipient(channel, dot1) {
+    const list = this._roomRecipients.get(channel);
+    if (!list) return;
+    const idx = list.findIndex(r => r.dot1 === dot1);
+    if (idx >= 0) list.splice(idx, 1);
+  }
+
+  /**
+   * Send an E2E encrypted v1.2 message via the SSE relay.
+   * The body is AES-256-GCM encrypted; the body key is wrapped per recipient.
+   * Requires canEncryptV12 === true.
+   *
+   * If no recipients are registered for the channel, the sender's own X25519 key
+   * is used as the sole recipient (useful for testing / solo encrypt).
+   *
+   * @param {string}  content        - Plaintext message body
+   * @param {string}  [channel]      - Override default channel
+   * @param {Array}   [attachments]  - DOTpost v1.3 attachments (metadata only; no content_b64 encrypted)
+   * @returns {Promise<object>} - The stored message object from the server (cipher_body, wraps included)
+   */
+  async sendEncrypted(content, channel, attachments) {
+    if (!this.canEncryptV12) {
+      throw new Error('sendEncrypted requires x25519PrivHex + x25519PubHex + ed25519PrivHex + dot1');
+    }
+
+    const ch = channel || this.channel;
+    const atts = validateAttachments(attachments || []);
+
+    // Build recipient list: registered recipients + always include self (for own-decrypt)
+    const recipients = (this._roomRecipients.get(ch) || []).slice();
+    // Ensure self is always included so sender can read back their own message
+    if (!recipients.some(r => r.dot1 === this._dot1)) {
+      recipients.push({ dot1: this._dot1, x25519PubHex: this._x25519Pub });
+    }
+
+    // Encrypt the body
+    const bodyKey    = generateBodyKey();
+    const bodyBytes  = Buffer.from(content, 'utf8');
+    const cipherBody = encryptBody(bodyBytes, bodyKey);
+
+    // Wrap body key for each recipient
+    const wraps = recipients.map(r => ({
+      recipient_dot1:   r.dot1,
+      wrapped_body_key: wrapBodyKey(bodyKey, this._x25519Priv, r.x25519PubHex, r.dot1, this._dot1),
+    }));
+
+    const id        = randomUUID();
+    const createdAt = new Date().toISOString();
+
+    const envelope = {
+      id,
+      version:          '1.2',
+      channel:          ch,
+      createdAt,
+      prev:             null,
+      from_dot1:        this._dot1,
+      from_ed25519_pub: this._ed25519Pub,
+      from_x25519_pub:  this._x25519Pub,
+      cipher_body:      cipherBody,
+      wraps,
+    };
+
+    envelope.sig = signV12Envelope(envelope, atts, this._ed25519Priv);
+    if (atts.length > 0) envelope.attachments = atts;
+
+    const res = await this._fetch('/messages', {
+      method: 'POST',
+      body:   JSON.stringify(envelope),
+    });
+    return res.message;
+  }
+
+  /**
+   * Push an encrypted v1.2 envelope to a recipient's mathpost-mailbox instead of
+   * (or in addition to) the SSE relay. Useful for offline delivery.
+   *
+   * Requires canEncryptV12 === true and at least one recipient registered for the channel.
+   *
+   * @param {string}  content        - Plaintext message body
+   * @param {string}  [channel]      - Override default channel
+   * @param {string}  [mailboxBase]  - Mailbox relay base URL (default: https://relay.piedpiper.fun)
+   * @returns {Promise<Array>} - Array of { recipient_dot1, status, body } push results
+   */
+  async sendViaMailbox(content, channel, mailboxBase) {
+    if (!this.canEncryptV12) {
+      throw new Error('sendViaMailbox requires v1.2 identity (x25519 + ed25519 + dot1)');
+    }
+
+    const ch = channel || this.channel;
+    const recipients = this._roomRecipients.get(ch) || [];
+    if (recipients.length === 0) {
+      throw new Error(`sendViaMailbox: no recipients registered for channel "${ch}". Call addRoomRecipient first.`);
+    }
+
+    const bodyKey    = generateBodyKey();
+    const bodyBytes  = Buffer.from(content, 'utf8');
+    const cipherBody = encryptBody(bodyBytes, bodyKey);
+
+    // Build per-recipient wrap list (include self for own-message readback)
+    const allRecipients = recipients.slice();
+    if (!allRecipients.some(r => r.dot1 === this._dot1)) {
+      allRecipients.push({ dot1: this._dot1, x25519PubHex: this._x25519Pub });
+    }
+
+    const wraps = allRecipients.map(r => ({
+      recipient_dot1:   r.dot1,
+      wrapped_body_key: wrapBodyKey(bodyKey, this._x25519Priv, r.x25519PubHex, r.dot1, this._dot1),
+    }));
+
+    const id        = randomUUID();
+    const createdAt = new Date().toISOString();
+    const envelope  = {
+      id,
+      version:          '1.2',
+      channel:          ch,
+      createdAt,
+      prev:             null,
+      from_dot1:        this._dot1,
+      from_ed25519_pub: this._ed25519Pub,
+      from_x25519_pub:  this._x25519Pub,
+      cipher_body:      cipherBody,
+      wraps,
+    };
+    envelope.sig = signV12Envelope(envelope, [], this._ed25519Priv);
+
+    // Push one copy to EACH recipient's mailbox (they each pull their own inbox)
+    const results = await Promise.all(
+      allRecipients.map(async (r) => {
+        try {
+          const { status, body } = await pushEnvelope(mailboxBase, r.dot1, envelope);
+          return { recipient_dot1: r.dot1, status, body };
+        } catch (err) {
+          return { recipient_dot1: r.dot1, status: -1, error: err.message };
+        }
+      })
+    );
+    return results;
+  }
+
+  /**
+   * Pull envelopes from the mathpost-mailbox relay addressed to this client's dot1.
+   * Decrypts each envelope and emits decrypted messages via subscribe() handlers,
+   * exactly like SSE messages.
+   *
+   * @param {string}  [mailboxBase]  - Mailbox relay base URL (default: https://relay.piedpiper.fun)
+   * @returns {Promise<{ pulled: number, decrypted: number, errors: number }>}
+   */
+  async pullFromMailbox(mailboxBase) {
+    if (!this._dot1) throw new Error('pullFromMailbox requires dot1 identity');
+    if (!this.canEncryptV12) throw new Error('pullFromMailbox requires x25519 key pair to decrypt');
+
+    const sinceSeq = this._mailboxCursor.get(this._dot1) || 0;
+    const { status, body } = await pullEnvelopes(mailboxBase, this._dot1, sinceSeq);
+
+    if (status !== 200 || !Array.isArray(body.envelopes)) {
+      throw new Error(`pullFromMailbox: relay returned ${status}: ${JSON.stringify(body)}`);
+    }
+
+    let decrypted = 0;
+    let errors    = 0;
+
+    for (const envelope of body.envelopes) {
+      try {
+        const msg = this._decryptIncomingV12(envelope);
+        if (msg) {
+          // Skip own messages unless includeOwn
+          if (!this.includeOwn && envelope.from_dot1 === this._dot1) continue;
+          for (const h of this._handlers) { try { h(msg); } catch (_) {} }
+          decrypted++;
+        }
+      } catch (_) {
+        errors++;
+      }
+    }
+
+    // Advance cursor to the last sequence returned
+    if (typeof body.next_cursor === 'number') {
+      this._mailboxCursor.set(this._dot1, body.next_cursor);
+    }
+
+    return { pulled: body.envelopes.length, decrypted, errors };
+  }
+
   // ── v1.1 signing internals ───────────────────────────────────────────────────
 
   async _sendV11(content, channel, atts) {
@@ -212,8 +463,14 @@ class PiperClient {
     return res.message;
   }
 
-  /** Verify a v1.1 message received from the server. Returns the msg with `verified` field added. */
+  /**
+   * Verify a v1.1 message received from the server.
+   * Returns the msg with `verified` field added.
+   */
   _verifyIncoming(msg) {
+    if (msg.version === '1.2') {
+      return this._decryptIncomingV12(msg) || { ...msg, verified: false };
+    }
     if (msg.version !== '1.1' || !msg.sig || !msg.from_ed25519_pub) {
       return { ...msg, verified: false, unsigned: true };
     }
@@ -224,6 +481,56 @@ class PiperClient {
     } catch (_) {
       return { ...msg, verified: false };
     }
+  }
+
+  /**
+   * Attempt to decrypt a v1.2 sealed-body envelope.
+   * Verifies the ed25519 sig first. Then finds our wrap and decrypts.
+   * Returns a plain message object with `content` set to the plaintext,
+   * or null if this envelope was not addressed to us.
+   * Throws on sig failure or auth-decryption failure.
+   *
+   * @param {object} envelope - v1.2 message object (with cipher_body and wraps)
+   * @returns {object|null}
+   */
+  _decryptIncomingV12(envelope) {
+    if (!envelope || envelope.version !== '1.2' || !envelope.cipher_body) return null;
+
+    // Verify sig (server already checked, but client double-checks)
+    const atts = (envelope.attachments || []).map(a => ({ ...a, content_b64: a.content_b64 || '' }));
+    const check = verifyV12Envelope(envelope, atts);
+    if (!check.ok) throw new Error(`v1.2 sig invalid: ${check.reason}`);
+
+    // Can we decrypt? Need our own dot1 and x25519 key pair
+    if (!this._dot1 || !this._x25519Priv || !this._x25519Pub) {
+      // No key — return with encrypted:true but no plaintext
+      return { ...envelope, verified: true, decrypted: false };
+    }
+
+    // Find our wrap
+    const wraps = Array.isArray(envelope.wraps) ? envelope.wraps : [];
+    const myWrap = wraps.find(w => w.recipient_dot1 === this._dot1);
+    if (!myWrap) {
+      // Envelope not addressed to us — deliver as-is with decrypted:false
+      return { ...envelope, verified: true, decrypted: false };
+    }
+
+    // Unwrap body key and decrypt
+    const bodyKey   = unwrapBodyKey(
+      myWrap.wrapped_body_key,
+      this._x25519Priv,
+      envelope.from_x25519_pub,
+      this._dot1,
+      envelope.from_dot1,
+    );
+    const plaintext = decryptBody(envelope.cipher_body, bodyKey);
+
+    return {
+      ...envelope,
+      content:   plaintext.toString('utf8'),
+      verified:  true,
+      decrypted: true,
+    };
   }
 
   // ── internals ───────────────────────────────────────────────────────────────
@@ -342,4 +649,4 @@ class PiperClient {
   }
 }
 
-module.exports = { PiperClient };
+module.exports = { PiperClient, parseCellFile };
