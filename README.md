@@ -1,6 +1,6 @@
 # piperchat
 
-**v1.1 — DOT-native** | ed25519-signed identities, dot1 addresses, DOTpost v1.3 attachments
+**v1.2 — sealed body** | X25519 E2E encrypted messages, ed25519-signed identities, mathpost-mailbox transport
 
 A minimal P2P chat node. Two browsers, one message, no server in the middle that owns your data. Each node holds its own message history. Peers sync documents directly using [iroh](https://github.com/n0-computer/iroh) — a Rust-based P2P document layer that works across NAT without a relay you don't control. When iroh is unavailable (firewalled network, CI), the server falls back to SSE relay mode and chat still works.
 
@@ -78,6 +78,49 @@ await c.send('hello from a cell');
 ```
 
 See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full wire format.
+
+## v1.2 — sealed body
+
+v1.2 adds end-to-end encrypted messages. The server never decrypts message bodies — it stores and forwards sealed blobs. Encryption is per-message, multi-recipient.
+
+### what changed in v1.2
+
+- **Sealed body:** Every v1.2 message has a `cipher_body` field (base64 AES-256-GCM). The `content` field is absent. Only listed recipients can read the message.
+- **Per-recipient key wraps:** A random 32-byte body key encrypts the message. That body key is wrapped once per recipient using X25519 ECDH + HKDF-SHA256 + AES-256-GCM. Each recipient's wrapped copy is in the `wraps[]` array.
+- **X25519 identity:** Senders and recipients need an X25519 keypair (in addition to their ed25519 signing key). Public keys are exchanged out of band before a sealed conversation can start.
+- **Mathpost-mailbox transport:** Alternatively, sealed envelopes can be pushed directly to recipients' inboxes at `https://relay.piedpiper.fun/mailbox/{dot1}/push`, bypassing the SSE relay entirely. The UI has a transport toggle.
+- **Browser UI:** x25519 private key input in the key banner; room recipients panel per channel; 🔒/🔓 badges on messages; async in-place decryption updates the UI when the key is available.
+
+### sending a v1.2 sealed message via the Node client
+
+```bash
+node -e "
+const { PiperClient } = require('./client');
+
+const alice = new PiperClient({
+  url:             'http://localhost:4100',
+  author:          'alice',
+  dot1:            'dot1:6d94e2c24a06486b',
+  ed25519PubHex:   process.env.ALICE_ED_PUB,
+  ed25519PrivHex:  process.env.ALICE_ED_PRIV,
+  x25519PubHex:    process.env.ALICE_X25519_PUB,
+  x25519PrivHex:   process.env.ALICE_X25519_PRIV,
+});
+
+// Add Bob as a recipient on channel 'direct'
+alice.addRoomRecipient('direct', {
+  dot1:          'dot1:abcdef0123456789',
+  x25519PubHex:  process.env.BOB_X25519_PUB,
+});
+
+const envelope = await alice.sendEncrypted('hello Bob', 'direct');
+console.log('sent sealed envelope:', envelope.id);
+"
+```
+
+The server verifies the ed25519 signature on every POST and stores the ciphertext opaquely. Bob polls his mailbox or subscribes via SSE to receive the envelope, then decrypts with his x25519 private key.
+
+See [docs/PROTOCOL.md](docs/PROTOCOL.md) for HKDF constants, canonical signing form, and the full v1.2 wire format.
 
 ## use it from code
 

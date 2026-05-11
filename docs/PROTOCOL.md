@@ -1,15 +1,164 @@
-# piper-chat wire format — v1.1
+# piper-chat wire format — v1.2
 
 ## Overview
 
-piper-chat supports two wire-format versions:
+piper-chat supports three wire-format versions:
 
 | Version | Description | Status |
 |---------|-------------|--------|
 | `1.0` | Legacy unsigned or browser-keypair-signed messages | **Accepted on receive, deprecated on send** |
-| `1.1` | DOT-native: ed25519-signed, dot1 sender identity, DOTpost v1.3 attachments | **Current** |
+| `1.1` | DOT-native: ed25519-signed, dot1 sender identity, DOTpost v1.3 attachments | **Accepted on receive** |
+| `1.2` | Sealed body: X25519 ECDH + AES-256-GCM per-message key, multi-recipient wraps | **Current** |
 
-v1.0 messages are accepted at receive time and stored with `unsigned: true`. New outgoing messages MUST be v1.1 (signed). Unsigned v1.0 messages are marked in the UI with a warning badge.
+v1.0/v1.1 messages are accepted at receive time. New outgoing messages from updated clients SHOULD be v1.2 (sealed body) when encryption is enabled.
+
+---
+
+## v1.2 sealed-body envelope
+
+A v1.2 envelope extends v1.1 with an encrypted body and per-recipient key wraps. The server stores the envelope opaquely — it never decrypts the body.
+
+```json
+{
+  "id":               "<uuid-v4>",
+  "version":          "1.2",
+  "channel":          "<channel name, default 'main', max 32 chars>",
+  "createdAt":        "<ISO 8601 timestamp>",
+  "prev":             "<16-hex prev hash | null>",
+
+  "from_dot1":        "<dot1:[0-9a-f]{16}>",
+  "from_ed25519_pub": "<64-hex ed25519 public key>",
+  "from_x25519_pub":  "<64-hex X25519 public key (Curve25519)>",
+
+  "cipher_body":      "<base64: nonce(12) || AES-256-GCM ciphertext || auth-tag(16)>",
+
+  "wraps": [
+    {
+      "recipient_dot1":   "<dot1:[0-9a-f]{16}>",
+      "wrapped_body_key": "<base64: nonce(12) || AES-256-GCM encrypted 32-byte body key || tag(16)>"
+    }
+  ],
+
+  "sig": "<128-hex ed25519 signature (covers all fields including cipher_body and wraps)>",
+
+  "attachments": [ ... ]
+}
+```
+
+**Key points:**
+- `cipher_body` — the message content encrypted with AES-256-GCM using a random per-message 32-byte body key. Format: `nonce(12 bytes) || ciphertext || GCM auth tag (16 bytes)`, base64-encoded.
+- `wraps` — one entry per recipient (including the sender themselves). Each entry holds the body key encrypted to that recipient's X25519 public key.
+- `from_x25519_pub` — the sender's X25519 public key (Curve25519), 64 lowercase hex = 32 raw bytes. Used by recipients to derive the shared ECDH secret for unwrapping their body key copy.
+- The `content` field is **absent** in v1.2 — the body key is the only way to recover the plaintext. The server never sees `content` for encrypted messages.
+
+---
+
+## §Sealed body: key derivation
+
+### Body key (per-message)
+
+A fresh 32-byte key is generated for each message:
+
+```
+body_key = random_bytes(32)
+```
+
+### Wrapping the body key for a recipient
+
+For each recipient, the body key is wrapped using ECDH + HKDF + AES-256-GCM:
+
+```
+shared_secret = X25519(sender_x25519_priv, recipient_x25519_pub)   // Curve25519 DH
+
+wrap_key = HKDF-SHA256(
+  ikm  = shared_secret,                           // 32 bytes
+  salt = "piperchat/v1.2/wrap",                   // UTF-8 bytes
+  info = UTF-8(recipient_dot1 + sender_dot1),     // concatenated, no separator
+  len  = 32                                        // output bytes
+)
+
+wrapped_body_key = AES-256-GCM-encrypt(
+  key      = wrap_key,
+  nonce    = random_bytes(12),
+  plaintext = body_key
+)
+// serialized as nonce(12) || ciphertext(32) || tag(16) → base64
+```
+
+### Unwrapping (recipient side)
+
+```
+shared_secret = X25519(recipient_x25519_priv, from_x25519_pub)
+
+wrap_key = HKDF-SHA256(
+  ikm  = shared_secret,
+  salt = "piperchat/v1.2/wrap",
+  info = UTF-8(recipient_dot1 + from_dot1),
+  len  = 32
+)
+
+body_key = AES-256-GCM-decrypt(wrapped_body_key, wrap_key)
+content  = AES-256-GCM-decrypt(cipher_body, body_key)
+```
+
+**Authentication:** AES-256-GCM provides ciphertext integrity. Any tampering with `cipher_body` or `wrapped_body_key` will cause decryption to throw. The HKDF `info` field binds each wrap to a specific (recipient, sender) pair — cross-recipient key reuse is cryptographically rejected.
+
+---
+
+## §v1.2 signature canonical form
+
+The `sig` field covers the following signed fields (same pattern as v1.1 but with additional v1.2 fields):
+
+```
+canonical_json::attachment_manifest_json
+```
+
+Signed fields (alphabetically sorted JSON): `channel`, `cipher_body`, `createdAt`, `from_dot1`, `from_ed25519_pub`, `from_x25519_pub`, `id`, `prev`, `version`, `wraps`.
+
+`wraps` is included as a JSON array in the canonical form — any tampering with the recipient list or wrapped keys invalidates the signature.
+
+`content` is **not** a signed field (it is absent in v1.2; the body key indirectly authenticates it via AES-256-GCM).
+
+---
+
+## §No forward secrecy in v1.2
+
+v1.2 uses static X25519 public keys (one per identity, not per-message). This means:
+- If a participant's X25519 private key is compromised, past sessions can be decrypted (no forward secrecy).
+- Forward secrecy via ephemeral X25519 keys (X3DH / Double Ratchet) is planned for v1.3.
+
+---
+
+## §Sealed-sender note
+
+v1.2 does NOT hide the sender's identity. The `from_dot1`, `from_ed25519_pub`, and `from_x25519_pub` fields are public metadata visible to the server and all recipients. This is consistent with piper-chat's public-channel design. Sealed-sender (hiding sender identity from the server) is out of scope for v1.2.
+
+---
+
+## §Mathpost-mailbox transport (v1.2 alternate path)
+
+v1.2 envelopes may also be delivered via the mathpost-mailbox relay at `https://relay.piedpiper.fun` instead of the SSE relay. The mailbox relay exposes:
+
+```
+POST /mailbox/{recipientDot1}/push   — push an envelope to a recipient's inbox
+GET  /mailbox/{recipientDot1}/pull?since={seq} — pull envelopes (cursor-based)
+GET  /health                         — relay health check
+```
+
+When `transport = 'mailbox'` is selected in the UI, the sender pushes one copy of the envelope to each recipient's inbox directly, bypassing the server's `POST /messages` endpoint. Recipients poll `pull` every 10 seconds. The mailbox cursor (last `next_cursor` from a `pull` response) is persisted to `sessionStorage`.
+
+---
+
+## §Backwards compatibility (v1.0/v1.1 → v1.2)
+
+| Direction | Behaviour |
+|-----------|-----------|
+| v1.0 send → v1.2 server | Accepted; stored with `unsigned_legacy: 1` |
+| v1.1 send → v1.2 server | Accepted; verified and stored |
+| v1.2 send → v1.2 server | Accepted; signature verified; body stored opaque |
+| v1.2 envelope → v1.0/v1.1 client | Rendered as `[sealed 🔒]` (unknown `cipher_body` field ignored) |
+
+v1.2 clients preserve full decode capability for all three versions on receive.
 
 ---
 
@@ -142,9 +291,9 @@ v1.0 canonical signing string: `"v1\n<pubkey>\n<channel>\n<signed_at>\n<content>
 | method | path        | description                                                    |
 |--------|-------------|----------------------------------------------------------------|
 | GET    | /           | chat UI (index.html)                                           |
-| GET    | /health     | node status JSON (`protocol_version: "1.1"`)                  |
+| GET    | /health     | node status JSON (`protocol_version: "1.2"`, `protocol_versions_supported: ["1.0","1.1","1.2"]`) |
 | GET    | /events     | SSE stream — replays history then live updates (`?channel=X`) |
-| POST   | /messages   | post a message (v1.1 or v1.0 body)                            |
+| POST   | /messages   | post a message (v1.0, v1.1, or v1.2 body)                    |
 | GET    | /messages   | fetch history (`?channel=X&limit=N&since=<ISO>`)              |
 | GET    | /channels   | list all channels                                              |
 | GET    | /ticket     | get iroh doc share ticket (if iroh is running)                 |
@@ -186,20 +335,29 @@ v1.1-specific columns added to the `messages` table:
 - `unsigned_legacy INTEGER DEFAULT 0` — 1 if no signature (v1.0 unsigned)
 - `attachments_json TEXT` — JSON-serialised attachments array (full, including content_b64)
 
+v1.2-specific columns (added in v1.2.0 via `ALTER TABLE` on first start):
+- `encrypted INTEGER DEFAULT 0` — 1 if the message body is sealed (v1.2)
+- `from_x25519_pub TEXT` — sender's X25519 public key (v1.2 only)
+- `cipher_body TEXT` — base64 AES-256-GCM encrypted body (v1.2 only)
+- `wraps_json TEXT` — JSON array of `{recipient_dot1, wrapped_body_key}` entries (v1.2 only)
+
 ---
 
 ## constraints
 
-- Public plaintext chat. Messages are plain text in transit and at rest. No end-to-end encryption (see v1.2 roadmap for AES-256-GCM encrypted bodies).
-- No message deletion. The append-only chain is intentional.
-- Sender identity is intentionally public. This is NOT sealed-sender architecture.
-- `ed25519_priv_hex` is stored only in `sessionStorage` in the browser client — never in `localStorage`, never sent to the server.
+- When `_encryptEnabled = false` in the browser, messages are sent as v1.1 (plaintext + ed25519 signed). Plaintext messages are visible to the server.
+- When `_encryptEnabled = true`, messages are sent as v1.2 (sealed body). The server stores the ciphertext opaquely and cannot read the content.
+- X25519 and ed25519 private keys are stored only in `sessionStorage` — never in `localStorage`, never sent to the server.
+- **No forward secrecy in v1.2.** A static X25519 key per identity means past sessions are not protected against future key compromise.
+- Sender identity (`from_dot1`, `from_x25519_pub`, `from_ed25519_pub`) is public metadata in v1.2 — the server and all recipients see who sent the message. Sealed-sender (hiding the sender) is out of scope for this version.
 - iroh P2P connectivity depends on NAT traversal. Behind strict symmetric NAT, falls back to relay mode.
+- No message deletion. The append-only chain is intentional.
 
 ---
 
-## v1.2 roadmap (out of scope for v1.1)
+## v1.3 roadmap
 
-- AES-256-GCM encrypted message bodies (sealed body; key exchanged via X25519)
+- Forward secrecy via ephemeral X25519 keys (X3DH session setup / Double Ratchet per conversation)
+- Sealed-sender: hide `from_dot1` and sender pubkeys inside the encrypted body
 - Challenge-response dot1↔pubkey binding verification (closes the TOFU gap)
 - DiffBundle outer envelope (BLAKE3 ancestry + four-vector continuous diff)
