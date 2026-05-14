@@ -25,6 +25,7 @@ const {
   isV11Signed, verifyMessageV11, validateAttachments,
   isV12Envelope, verifyV12Envelope,
 } = require('./lib/crypto');
+const nacl = require('tweetnacl');
 const { checkFlood, checkPubkey, checkIp } = require('./lib/ratelimit');
 const { capture } = require('./lib/telemetry');
 
@@ -179,6 +180,9 @@ function toPublic(row) {
     base.sig              = row.sig;
   }
 
+  // v1.3 username
+  if (row.username) base.username = row.username;
+
   // v1.2 E2E encryption fields (only on encrypted messages)
   if (isV12) {
     base.from_x25519_pub = row.from_x25519_pub || null;
@@ -285,9 +289,9 @@ const server = http.createServer(async (req, res) => {
       messages:         db.countMessages(),
       keys:             db.countKeys(),
       uptime_s:         Math.floor(uptime),
-      version:          '1.2.0',
-      protocol_version: '1.2',
-      protocol_versions_supported: ['1.0', '1.1', '1.2'],
+      version:          '1.3.0',
+      protocol_version: '1.3',
+      protocol_versions_supported: ['1.0', '1.1', '1.2', '1.3'],
     }));
     return;
   }
@@ -318,6 +322,37 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'channel name must match [a-z0-9-]{1,32}' }));
       return;
+    }
+
+    // v1.3 username binding: if message includes a username, verify it's claimed by this dot1
+    // (Checked before we parse version-specific fields; username is independent of version.)
+    const claimedUsername = (typeof body.username === 'string' && body.username.length > 0)
+      ? body.username.toLowerCase()
+      : null;
+    if (claimedUsername) {
+      if (!db.validateUsername(claimedUsername)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'username must match [a-z0-9_-]{3,32}' }));
+        return;
+      }
+      // We need the sender dot1 — it's in from_dot1 for v1.1/v1.2, or absent for v1.0
+      const senderDot1 = (typeof body.from_dot1 === 'string') ? body.from_dot1 : null;
+      if (!senderDot1) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'username requires v1.1 or v1.2 identity (from_dot1 missing)' }));
+        return;
+      }
+      const usernameRow = db.getUsernameByName(claimedUsername);
+      if (!usernameRow) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'claim_first', detail: `username "${claimedUsername}" has not been claimed — POST /usernames/claim first` }));
+        return;
+      }
+      if (usernameRow.dot1 !== senderDot1) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'username_mismatch', detail: `username "${claimedUsername}" belongs to a different identity` }));
+        return;
+      }
     }
 
     const content = sanitize(body.content || '');
@@ -605,6 +640,8 @@ const server = http.createServer(async (req, res) => {
       cipher_body,
       wraps_json,
       encrypted,
+      // v1.3 username (optional)
+      username:        claimedUsername || null,
     };
 
     // dedup: same pubkey + id within 10 seconds in this channel.
@@ -676,6 +713,101 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     }
+    return;
+  }
+
+  // ── POST /usernames/claim → first-claim-wins username registration ─────────
+  if (p === '/usernames/claim' && req.method === 'POST') {
+    let body;
+    try {
+      body = JSON.parse((await readBody(req)).toString('utf8'));
+    } catch (_) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid JSON' }));
+      return;
+    }
+
+    const { username, dot1, ed25519_pub, sig } = body;
+
+    // Validate all fields present
+    const problems = [];
+    if (!db.validateUsername(username))
+      problems.push('username must match [a-z0-9_-]{3,32}');
+    if (typeof dot1 !== 'string' || !/^dot1:[0-9a-f]{16}$/.test(dot1))
+      problems.push('dot1 must match dot1:[0-9a-f]{16}');
+    if (typeof ed25519_pub !== 'string' || ed25519_pub.length !== 64 || !/^[0-9a-f]+$/.test(ed25519_pub))
+      problems.push('ed25519_pub must be 64 hex chars');
+    if (typeof sig !== 'string' || sig.length !== 128 || !/^[0-9a-f]+$/.test(sig))
+      problems.push('sig must be 128 hex chars');
+    if (problems.length > 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: problems.join('; ') }));
+      return;
+    }
+
+    // Verify signature: sig = ed25519_sign(priv, "claim:<username>:<dot1>")
+    const claimBytes = Buffer.from(`claim:${username.toLowerCase()}:${dot1}`, 'utf8');
+    const pubBytes   = Buffer.from(ed25519_pub, 'hex');
+    const sigBytes   = Buffer.from(sig, 'hex');
+    let sigValid = false;
+    try {
+      sigValid = nacl.sign.detached.verify(claimBytes, sigBytes, pubBytes);
+    } catch (_) {}
+    if (!sigValid) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'signature verification failed' }));
+      return;
+    }
+
+    const result = db.claimUsername(username.toLowerCase(), dot1, ed25519_pub);
+    if (!result.ok) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error:       'username taken',
+        claimed_by:  result.row.dot1,
+        claimed_at:  result.row.claimed_at,
+      }));
+      return;
+    }
+
+    capture('username_claimed', { username: username.toLowerCase(), dot1 });
+    res.writeHead(result.claimed ? 201 : 200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, username: result.row.username, dot1: result.row.dot1, claimed_at: result.row.claimed_at }));
+    return;
+  }
+
+  // ── GET /usernames/:name → look up by username ───────────────────────────────
+  const unameMatch = p.match(/^\/usernames\/([a-z0-9_-]{3,32})$/);
+  if (unameMatch && req.method === 'GET') {
+    const row = db.getUsernameByName(unameMatch[1]);
+    if (!row) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ username: row.username, dot1: row.dot1, claimed_at: row.claimed_at }));
+    return;
+  }
+
+  // ── GET /usernames?dot1=X  or  GET /usernames?limit=N ────────────────────────
+  if (p === '/usernames' && req.method === 'GET') {
+    const dot1Param = url.searchParams.get('dot1');
+    if (dot1Param) {
+      const row = db.getUsernameByDot1(dot1Param);
+      if (!row) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'not found' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ username: row.username, dot1: row.dot1, claimed_at: row.claimed_at }));
+      return;
+    }
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
+    const rows  = db.getRecentUsernames(limit);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(rows));
     return;
   }
 

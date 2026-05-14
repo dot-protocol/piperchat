@@ -588,6 +588,126 @@
       flex-shrink: 0;
     }
 
+    /* ── username claim banner ── */
+    .username-banner {
+      background: rgba(0, 255, 65, 0.05);
+      border: 1px solid rgba(0, 255, 65, 0.12);
+      border-radius: 5px;
+      padding: 7px 11px;
+      font-size: 10px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 7px;
+    }
+    .username-banner.hidden { display: none; }
+    .username-banner input {
+      flex: 1; min-width: 0;
+      font: inherit; font-size: 10px;
+      padding: 4px 8px;
+    }
+    .username-banner button { font-size: 10px; padding: 4px 10px; }
+    .username-display {
+      font-size: 10px; color: var(--accent);
+      background: rgba(0,255,65,0.08);
+      border: 1px solid rgba(0,255,65,0.15);
+      border-radius: 10px; padding: 1px 8px;
+      cursor: pointer; white-space: nowrap;
+    }
+    .username-display:hover { opacity: 0.8; }
+
+    /* ── contacts panel ── */
+    .contacts-panel {
+      width: 170px;
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      flex-shrink: 0; overflow: hidden;
+      transition: width 0.2s;
+    }
+    .contacts-panel.collapsed { width: 0; border-left: none; }
+
+    .contacts-header {
+      padding: 10px 12px 6px;
+      font-size: 10px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.5px;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .contacts-header span { cursor: pointer; }
+    .contacts-header span:hover { color: var(--text); }
+
+    .contacts-list {
+      flex: 1; overflow-y: auto; padding: 4px 0;
+    }
+    .contacts-list::-webkit-scrollbar { width: 4px; }
+    .contacts-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .contact-item {
+      padding: 7px 10px; font-size: 11px; cursor: pointer;
+      color: var(--muted); display: flex; align-items: center;
+      gap: 5px; min-width: 0;
+    }
+    .contact-item:hover { background: var(--card); color: var(--text); }
+
+    .contact-name {
+      flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      color: var(--text); font-size: 11px;
+    }
+    .contact-sub {
+      font-size: 9px; color: var(--muted); white-space: nowrap;
+    }
+    .contact-fav {
+      flex-shrink: 0; cursor: pointer; font-size: 12px;
+      opacity: 0.4; transition: opacity 0.1s;
+      background: none; border: none; padding: 0;
+      color: #ffd700; line-height: 1;
+    }
+    .contact-fav:hover { opacity: 1; transform: none; }
+    .contact-fav.active { opacity: 1; }
+
+    .contact-actions {
+      display: flex; gap: 4px; padding: 4px 10px 6px;
+      border-top: 1px solid var(--border);
+    }
+    .contact-io-btn {
+      flex: 1; font-size: 9px; padding: 3px 4px;
+      background: var(--card); color: var(--muted);
+      border: 1px solid var(--border); border-radius: 3px;
+    }
+    .contact-io-btn:hover { color: var(--text); border-color: var(--accent); opacity: 1; transform: none; }
+
+    /* save-sender pin button on messages */
+    .save-sender-btn {
+      display: none; position: absolute; right: 7px; top: 7px;
+      background: none; border: none; padding: 0;
+      font-size: 11px; color: var(--muted); cursor: pointer;
+      opacity: 0; transition: opacity 0.15s; transform: none;
+    }
+    .msg { position: relative; }
+    .msg:hover .save-sender-btn { opacity: 0.6; display: block; }
+    .save-sender-btn:hover { opacity: 1 !important; }
+    .save-sender-btn.saved { color: var(--accent); opacity: 0.8 !important; display: block !important; }
+
+    /* contacts toggle in header */
+    .contacts-toggle-btn {
+      background: var(--card); color: var(--muted);
+      border: 1px solid var(--border); font-size: 11px;
+      padding: 4px 8px; border-radius: 4px;
+      flex-shrink: 0;
+    }
+    .contacts-toggle-btn:hover { color: var(--text); border-color: var(--accent); opacity: 1; transform: none; }
+    .contacts-toggle-btn.active { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+
+    /* nickname edit inline */
+    .contact-nick-input {
+      flex: 1; font-size: 10px; padding: 2px 5px;
+      background: var(--card); border: 1px solid var(--accent);
+      color: var(--text); border-radius: 3px; min-width: 0;
+    }
+
     @media (max-width: 600px) {
       .sidebar { width: 110px; }
       :root { --sidebar-w: 110px; }
@@ -596,6 +716,7 @@
       .messages { padding: 10px 12px; }
       .input-area { padding: 10px 12px; }
       .id-pill { display: none; }
+      .contacts-panel { display: none; }
     }
   </style>
 </head>
@@ -613,6 +734,7 @@
     <span id="stat-mode" style="color:var(--muted)">relay</span>
   </div>
   <div class="id-pill" id="id-pill" title="your public key">…</div>
+  <button class="contacts-toggle-btn" id="contacts-toggle-btn" title="show/hide contacts">👥</button>
 </header>
 
 <div class="body-wrap">
@@ -631,7 +753,7 @@
   </nav>
 
   <!-- main chat -->
-  <div class="main">
+  <div class="main" id="main-area">
     <div class="messages" id="messages">
       <div class="empty" id="empty">
         the channel is empty. be the first.
@@ -639,6 +761,13 @@
     </div>
 
     <div class="input-area">
+      <!-- v1.3 username claim banner -->
+      <div class="username-banner" id="username-banner">
+        <span>@</span>
+        <input type="text" id="username-input" placeholder="claim a username" maxlength="32" autocomplete="off">
+        <button id="username-claim-btn">claim</button>
+        <span id="username-status" style="color:var(--muted);font-size:9px;"></span>
+      </div>
       <!-- v1.1/v1.2 key setup banner (shown until priv key is set for this session) -->
       <div class="key-banner" id="key-banner">
         <span>🔑</span>
@@ -689,6 +818,23 @@
       <input type="file" id="file-input" multiple accept="*/*" style="display:none">
     </div>
   </div>
+
+  <!-- contacts panel -->
+  <aside class="contacts-panel collapsed" id="contacts-panel">
+    <div class="contacts-header">
+      <span>contacts</span>
+      <span onclick="toggleContacts()" title="close">✕</span>
+    </div>
+    <div class="contacts-list" id="contacts-list">
+      <!-- populated by JS -->
+    </div>
+    <div class="contact-actions">
+      <button class="contact-io-btn" onclick="exportContacts()" title="export contacts.json">↓ export</button>
+      <label class="contact-io-btn" style="text-align:center;cursor:pointer;display:block;padding:3px 4px;" title="import contacts.json">
+        ↑ import<input type="file" id="contacts-import-input" accept=".json" style="display:none">
+      </label>
+    </div>
+  </aside>
 </div>
 
 <!-- peer connect modal -->
@@ -1283,6 +1429,8 @@ $privKeyBtn.addEventListener('click', async () => {
     else $x25519PrivInput.value = '';
   }
   updateKeyBanner();
+  // v1.3: once identity is set, initialise username banner
+  if (typeof initUsernameBanner === 'function') initUsernameBanner();
 });
 
 $privKeySkip.addEventListener('click', () => {
@@ -1691,8 +1839,17 @@ function renderMsg(msg) {
     identityBadge = `<span class="legacy-tag">unsigned</span>`;
   }
 
+  // v1.3: prefer claimed username or local contact nickname over author_name
+  let displayAuthor = msg.author_name || msg.author || (msg.from_dot1 ? msg.from_dot1.slice(-8) : 'anon');
+  if (msg.from_dot1) {
+    const savedContact = getContactByDot1(msg.from_dot1);
+    if (savedContact && savedContact.nickname) displayAuthor = savedContact.nickname;
+    else if (msg.username) displayAuthor = '@' + msg.username;
+    else if (savedContact && savedContact.username) displayAuthor = '@' + savedContact.username;
+  }
+
   const authorMeta = `<span class="msg-author">
-    ${esc(msg.author_name || msg.author || (msg.from_dot1 ? msg.from_dot1.slice(-8) : 'anon'))}
+    ${esc(displayAuthor)}
     ${identityBadge}
   </span>`;
 
@@ -1740,6 +1897,16 @@ function renderMsg(msg) {
       attEl.appendChild(chip);
     }
     el.appendChild(attEl);
+  }
+
+  // v1.3: save-sender button + contact last-seen update
+  addSaveSenderBtn(el, msg);
+  if (msg.from_dot1 && (!_dot1 || msg.from_dot1 !== _dot1)) {
+    updateContactLastSeen(msg.from_dot1, {
+      username:    msg.username || null,
+      x25519_pub:  msg.from_x25519_pub || null,
+      ed25519_pub: msg.from_ed25519_pub || null,
+    });
   }
 
   $msgs.appendChild(el);
@@ -1843,11 +2010,13 @@ window.addEventListener('hashchange', () => {
 (async () => {
   await loadOrCreateKeypair();
   updateKeyBanner();
+  initUsernameBanner();
 
   const hashCh = parseHashChannel();
   if (hashCh) { activeChannel = hashCh; $activeChBadge.textContent = hashCh; }
 
   renderChannelList();
+  renderContactsList();
   connectSSE();
   pollHealth();
   pollChannels();
@@ -1855,6 +2024,367 @@ window.addEventListener('hashchange', () => {
   setInterval(pollChannels, 15_000);
   updateHash(activeChannel);
 })();
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── v1.3 USERNAME CLAIM ───────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+
+const USERNAME_STORAGE_KEY = 'piper-claimed-username'; // localStorage, not session
+const $usernameBanner  = document.getElementById('username-banner');
+const $usernameInput   = document.getElementById('username-input');
+const $usernameClaimBtn = document.getElementById('username-claim-btn');
+const $usernameStatus  = document.getElementById('username-status');
+
+function initUsernameBanner() {
+  const saved = localStorage.getItem(USERNAME_STORAGE_KEY);
+  if (saved) {
+    // Already claimed — show compact display instead of banner
+    showUsernameDisplay(saved);
+    return;
+  }
+  // Only show claim banner if we have a v1.1/v1.2 identity
+  if (!hasV11Identity()) {
+    $usernameBanner.classList.add('hidden');
+    return;
+  }
+  $usernameBanner.classList.remove('hidden');
+}
+
+function showUsernameDisplay(username) {
+  // Replace banner with a compact pill showing the claimed username
+  $usernameBanner.innerHTML =
+    `<span style="color:var(--muted);font-size:10px;">@</span>` +
+    `<span class="username-display" id="username-display" title="your username — click to copy">@${esc(username)}</span>` +
+    `<span id="username-status" style="color:var(--muted);font-size:9px;margin-left:4px;"></span>`;
+  $usernameBanner.classList.remove('hidden');
+  document.getElementById('username-display').addEventListener('click', () => {
+    navigator.clipboard.writeText('@' + username).catch(() => {});
+  });
+}
+
+async function claimUsername() {
+  if (!hasV11Identity()) {
+    alert('Set your ed25519 private key first — username claim requires a signed identity.');
+    return;
+  }
+  const username = ($usernameInput.value || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  if (!username || username.length < 3) {
+    $usernameStatus.textContent = '3–32 chars, a-z 0-9 _ -';
+    return;
+  }
+  $usernameClaimBtn.disabled = true;
+  $usernameStatus.textContent = 'claiming…';
+
+  try {
+    // Build canonical claim payload and sign it
+    const claimText  = `claim:${username}:${_dot1}`;
+    const claimBytes = new TextEncoder().encode(claimText);
+    const privBytes  = hex2buf(_ed25519Priv);
+    const keypair    = nacl.sign.keyPair.fromSecretKey(privBytes);
+    const sigBytes   = nacl.sign.detached(claimBytes, keypair.secretKey);
+    const sigHex     = buf2hex(sigBytes);
+
+    const resp = await fetch(`${BASE}usernames/claim`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        username,
+        dot1:        _dot1,
+        ed25519_pub: _ed25519Pub,
+        sig:         sigHex,
+      }),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      localStorage.setItem(USERNAME_STORAGE_KEY, username);
+      showUsernameDisplay(username);
+    } else if (resp.status === 409) {
+      $usernameStatus.textContent = 'taken by ' + (data.claimed_by || 'another user').slice(-6);
+      $usernameClaimBtn.disabled = false;
+    } else {
+      $usernameStatus.textContent = data.error || 'error';
+      $usernameClaimBtn.disabled = false;
+    }
+  } catch (err) {
+    $usernameStatus.textContent = 'network error';
+    $usernameClaimBtn.disabled = false;
+  }
+}
+
+$usernameClaimBtn.addEventListener('click', claimUsername);
+$usernameInput.addEventListener('keydown', e => { if (e.key === 'Enter') claimUsername(); });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── v1.3 CONTACTS (browser-side localStorage) ────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+
+const CONTACTS_KEY = 'piperchat.contacts';
+
+/**
+ * Contact schema:
+ * {
+ *   dot1: "dot1:...",
+ *   username: "alice" | null,
+ *   x25519_pub: "64hex" | null,
+ *   ed25519_pub: "64hex" | null,
+ *   added_at: ms,
+ *   favourite: bool,
+ *   last_seen_at: ms,
+ *   nickname: "user-supplied label" | null
+ * }
+ */
+
+function loadContacts() {
+  try {
+    const raw = localStorage.getItem(CONTACTS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (_) { return []; }
+}
+
+function saveContacts(list) {
+  localStorage.setItem(CONTACTS_KEY, JSON.stringify(list));
+}
+
+function getContactByDot1(dot1) {
+  return loadContacts().find(c => c.dot1 === dot1) || null;
+}
+
+function addContact(dot1, { username = null, x25519_pub = null, ed25519_pub = null } = {}) {
+  const list = loadContacts();
+  const existing = list.findIndex(c => c.dot1 === dot1);
+  if (existing >= 0) {
+    // Update fields if provided
+    if (username) list[existing].username = username;
+    if (x25519_pub) list[existing].x25519_pub = x25519_pub;
+    if (ed25519_pub) list[existing].ed25519_pub = ed25519_pub;
+    list[existing].last_seen_at = Date.now();
+    saveContacts(list);
+    return list[existing];
+  }
+  const contact = {
+    dot1,
+    username,
+    x25519_pub,
+    ed25519_pub,
+    added_at:     Date.now(),
+    favourite:    false,
+    last_seen_at: Date.now(),
+    nickname:     null,
+  };
+  list.push(contact);
+  saveContacts(list);
+  return contact;
+}
+
+function toggleFavourite(dot1) {
+  const list = loadContacts();
+  const idx  = list.findIndex(c => c.dot1 === dot1);
+  if (idx < 0) return;
+  list[idx].favourite = !list[idx].favourite;
+  saveContacts(list);
+  renderContactsList();
+}
+
+function setNickname(dot1, nickname) {
+  const list = loadContacts();
+  const idx  = list.findIndex(c => c.dot1 === dot1);
+  if (idx < 0) return;
+  list[idx].nickname = nickname || null;
+  saveContacts(list);
+  renderContactsList();
+}
+
+function updateContactLastSeen(dot1, { username, x25519_pub, ed25519_pub } = {}) {
+  const list = loadContacts();
+  const idx  = list.findIndex(c => c.dot1 === dot1);
+  if (idx < 0) return; // not in contacts, nothing to update
+  list[idx].last_seen_at = Date.now();
+  if (username && !list[idx].username) list[idx].username = username;
+  if (x25519_pub && !list[idx].x25519_pub) list[idx].x25519_pub = x25519_pub;
+  if (ed25519_pub && !list[idx].ed25519_pub) list[idx].ed25519_pub = ed25519_pub;
+  saveContacts(list);
+}
+
+// ── Reverse-lookup: fetch username for a dot1 from server ───────────────────
+async function fetchUsernameForDot1(dot1) {
+  try {
+    const r = await fetch(`${BASE}usernames?dot1=${encodeURIComponent(dot1)}`);
+    if (!r.ok) return null;
+    const d = await r.json();
+    return d.username || null;
+  } catch (_) { return null; }
+}
+
+// ── Contacts panel render ────────────────────────────────────────────────────
+const $contactsPanel      = document.getElementById('contacts-panel');
+const $contactsList       = document.getElementById('contacts-list');
+const $contactsToggleBtn  = document.getElementById('contacts-toggle-btn');
+const $contactsImportInput = document.getElementById('contacts-import-input');
+
+let _contactsPanelOpen = false;
+
+function toggleContacts() {
+  _contactsPanelOpen = !_contactsPanelOpen;
+  $contactsPanel.classList.toggle('collapsed', !_contactsPanelOpen);
+  $contactsToggleBtn.classList.toggle('active', _contactsPanelOpen);
+  if (_contactsPanelOpen) renderContactsList();
+}
+
+$contactsToggleBtn.addEventListener('click', toggleContacts);
+
+function renderContactsList() {
+  $contactsList.innerHTML = '';
+  let contacts = loadContacts();
+  // Sort: favourites first, then by last_seen_at desc
+  contacts = [...contacts].sort((a, b) => {
+    if (a.favourite && !b.favourite) return -1;
+    if (!a.favourite && b.favourite) return 1;
+    return (b.last_seen_at || 0) - (a.last_seen_at || 0);
+  });
+
+  if (contacts.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'padding:16px 12px;font-size:10px;color:var(--muted);text-align:center;';
+    empty.textContent = 'no contacts yet\nsave senders with 📌';
+    $contactsList.appendChild(empty);
+    return;
+  }
+
+  for (const c of contacts) {
+    const item = document.createElement('div');
+    item.className = 'contact-item';
+    item.dataset.dot1 = c.dot1;
+
+    const displayName = c.nickname || c.username || (c.dot1.replace('dot1:', '').slice(-6));
+    const subLabel    = c.nickname && c.username ? '@' + c.username : (c.dot1.replace('dot1:', '').slice(-6));
+
+    item.innerHTML =
+      `<button class="contact-fav ${c.favourite ? 'active' : ''}" title="${c.favourite ? 'unfavourite' : 'favourite'}">★</button>` +
+      `<div style="flex:1;min-width:0;">` +
+        `<div class="contact-name" title="${esc(c.dot1)}">${esc(displayName)}</div>` +
+        `<div class="contact-sub">${esc(subLabel)}</div>` +
+      `</div>` +
+      `<button class="contact-fav" style="font-size:10px;color:var(--muted);opacity:0.5;" title="edit nickname">✎</button>`;
+
+    // Favourite toggle
+    item.querySelector('.contact-fav').addEventListener('click', e => {
+      e.stopPropagation();
+      toggleFavourite(c.dot1);
+    });
+
+    // Nickname edit
+    const editBtn = item.querySelectorAll('.contact-fav')[1];
+    editBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      const nameEl = item.querySelector('.contact-name');
+      const current = c.nickname || '';
+      const input = document.createElement('input');
+      input.className = 'contact-nick-input';
+      input.value = current;
+      input.placeholder = 'nickname';
+      input.maxLength = 32;
+      nameEl.replaceWith(input);
+      input.focus();
+      const commit = () => {
+        setNickname(c.dot1, input.value.trim());
+      };
+      input.addEventListener('blur', commit);
+      input.addEventListener('keydown', e2 => {
+        if (e2.key === 'Enter') { input.blur(); }
+        if (e2.key === 'Escape') { input.value = current; input.blur(); }
+      });
+    });
+
+    // Click contact → open DM channel
+    item.addEventListener('click', () => {
+      if (!_dot1) return;
+      const a = _dot1.replace('dot1:', '');
+      const b = c.dot1.replace('dot1:', '');
+      const dmChannel = 'dm-' + [a, b].sort().join('-').slice(0, 32);
+      addChannelIfNew(dmChannel);
+      switchChannel(dmChannel);
+      // If we have their x25519 pub, auto-add as recipient for this channel
+      if (c.x25519_pub && hasV12Identity()) {
+        addRecipient(dmChannel, c.dot1, c.x25519_pub);
+      }
+      // Close contacts panel on mobile
+      if (window.innerWidth < 600) toggleContacts();
+    });
+
+    $contactsList.appendChild(item);
+  }
+}
+
+// ── Save-sender button on incoming messages ──────────────────────────────────
+function addSaveSenderBtn(el, msg) {
+  // Only show for messages with a dot1 identity that isn't ourselves
+  const senderDot1 = msg.from_dot1 || null;
+  if (!senderDot1) return;
+  if (_dot1 && senderDot1 === _dot1) return; // own message
+
+  const alreadySaved = Boolean(getContactByDot1(senderDot1));
+  const pin = document.createElement('button');
+  pin.className = 'save-sender-btn' + (alreadySaved ? ' saved' : '');
+  pin.title     = alreadySaved ? 'saved to contacts' : 'save to contacts';
+  pin.textContent = '📌';
+
+  pin.addEventListener('click', async e => {
+    e.stopPropagation();
+    pin.disabled = true;
+    // Try to resolve username from server
+    let username = msg.username || null;
+    if (!username) username = await fetchUsernameForDot1(senderDot1);
+    addContact(senderDot1, {
+      username,
+      x25519_pub:  msg.from_x25519_pub || null,
+      ed25519_pub: msg.from_ed25519_pub || null,
+    });
+    pin.classList.add('saved');
+    pin.title     = 'saved to contacts';
+    pin.disabled  = false;
+    if (_contactsPanelOpen) renderContactsList();
+  });
+
+  el.appendChild(pin);
+}
+
+// ── Export / Import contacts ─────────────────────────────────────────────────
+function exportContacts() {
+  const contacts = loadContacts();
+  const blob = new Blob([JSON.stringify(contacts, null, 2)], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = 'piperchat-contacts.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+$contactsImportInput.addEventListener('change', async () => {
+  const file = $contactsImportInput.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const imported = JSON.parse(text);
+    if (!Array.isArray(imported)) { alert('Invalid contacts file'); return; }
+    const existing = loadContacts();
+    const existingDot1s = new Set(existing.map(c => c.dot1));
+    let added = 0;
+    for (const c of imported) {
+      if (typeof c.dot1 !== 'string') continue;
+      if (!existingDot1s.has(c.dot1)) {
+        existing.push({ ...c, added_at: c.added_at || Date.now() });
+        added++;
+      }
+    }
+    saveContacts(existing);
+    renderContactsList();
+    alert(`Imported ${added} new contact(s).`);
+  } catch (err) {
+    alert('Import failed: ' + err.message);
+  }
+  $contactsImportInput.value = '';
+});
 </script>
 </body>
 </html>
