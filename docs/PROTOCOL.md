@@ -377,22 +377,32 @@ Usernames are claimed first-wins via `POST /usernames/claim`:
 ```
 POST /usernames/claim
 {
-  "username":    "alice",
-  "dot1":        "dot1...",
-  "ed25519_pub": "<base64 32-byte ed25519 verify key>",
-  "sig":         "<base64 ed25519 sig over canonical JSON of {username, dot1, ed25519_pub, claimed_at}>",
-  "claimed_at":  1747244640.123    // unix seconds, server compares against now within ±5min
+  "username":    "alice",                                   // /^[a-z0-9_-]{3,32}$/
+  "dot1":        "dot1:0123456789abcdef",                   // /^dot1:[0-9a-f]{16}$/
+  "ed25519_pub": "<64 hex chars — 32-byte ed25519 verify key>",
+  "sig":         "<128 hex chars — ed25519 detached sig>"
 }
 ```
 
+The signed bytes are the literal UTF-8 string:
+
+```
+claim:<username>:<dot1>
+```
+
+(Example: `claim:alice:dot1:0123456789abcdef`.) No canonical-JSON canonicalisation required — the claim payload is a single fixed string, easy to reproduce in any client without a JSON canonicaliser. The signature is verified with `nacl.sign.detached.verify(claimBytes, sigBytes, pubBytes)`.
+
 Server validates:
 - Username regex
-- `ed25519_pub` derives the same `dot1` (binding)
-- Signature verifies over canonical-JSON of the four fields
-- `claimed_at` within ±5min of server clock
-- No prior claim exists for that username (first-wins; subsequent claims for the same name return `409 already_claimed`)
+- `dot1` matches `dot1:[0-9a-f]{16}`
+- `ed25519_pub` is 64 hex chars
+- `sig` is 128 hex chars
+- Signature verifies over `claim:<username>:<dot1>`
+- No prior claim exists for that username (first-wins; subsequent claims for the same name return `409 username taken` with `{claimed_by, claimed_at}`)
 
-On success the record is inserted into the `usernames` SQLite table with `(username PRIMARY KEY, dot1, claimed_at, ed25519_pub)`. The claim is permanent — no `release` operation exists in v1.3. (Recoverable identity is deferred to v1.4 — see roadmap.)
+On success the record is inserted into the `usernames` SQLite table with `(username PRIMARY KEY, dot1, claimed_at, ed25519_pub)`. `claimed_at` is set by the server (unix seconds), not by the client. The claim is permanent — no `release` operation exists in v1.3. (Recoverable identity is deferred to v1.4 — see roadmap.)
+
+**Note on dot1↔pubkey binding**: v1.3 does not verify that `ed25519_pub` actually derives `dot1`. The username is bound to whichever `dot1` was first to submit a valid signature over the claim string. Clients SHOULD use a `dot1` derived from their `ed25519_pub`, but the server does not enforce this. Tightening to "ed25519_pub MUST derive dot1" is part of v1.4 challenge-response binding work.
 
 ### Resolution
 
