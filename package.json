@@ -1,6 +1,6 @@
 {
   "name": "piperchat",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "P2P chat with E2E sealed bodies, Ed25519-signed identities, SQLite storage, and SSE relay",
   "license": "Apache-2.0",
   "author": "The Pied Piper Authors",

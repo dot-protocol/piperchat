@@ -1,16 +1,17 @@
-# piper-chat wire format — v1.2
+# piper-chat wire format — v1.3
 
 ## Overview
 
-piper-chat supports three wire-format versions:
+piper-chat supports four wire-format versions:
 
 | Version | Description | Status |
 |---------|-------------|--------|
 | `1.0` | Legacy unsigned or browser-keypair-signed messages | **Accepted on receive, deprecated on send** |
 | `1.1` | DOT-native: ed25519-signed, dot1 sender identity, DOTpost v1.3 attachments | **Accepted on receive** |
-| `1.2` | Sealed body: X25519 ECDH + AES-256-GCM per-message key, multi-recipient wraps | **Current** |
+| `1.2` | Sealed body: X25519 ECDH + AES-256-GCM per-message key, multi-recipient wraps | **Accepted on receive** |
+| `1.3` | v1.2 envelope + optional `username` field bound to a server-side first-claim-wins registry | **Current** |
 
-v1.0/v1.1 messages are accepted at receive time. New outgoing messages from updated clients SHOULD be v1.2 (sealed body) when encryption is enabled.
+v1.0/v1.1/v1.2 messages are accepted at receive time. New outgoing messages from updated clients SHOULD be v1.2 (sealed body) when encryption is enabled, plus an optional v1.3 `username` field if the sender has claimed a username.
 
 ---
 
@@ -355,9 +356,67 @@ v1.2-specific columns (added in v1.2.0 via `ALTER TABLE` on first start):
 
 ---
 
-## v1.3 roadmap
+## v1.3 username layer (current)
+
+v1.3 adds an optional `username` field to the v1.1/v1.2 message envelope, plus a server-side first-claim-wins registry. The crypto layer is unchanged from v1.2 — usernames are purely a human-readable alias bound to a dot1 identity.
+
+### Envelope addition
+
+Any v1.1 or v1.2 envelope MAY include:
+
+```
+"username": "alice"            // optional, lowercase, /^[a-z0-9_-]{3,32}$/
+```
+
+If present, the server verifies the username is claimed by the sender's `from_dot1` before accepting the message. Mismatch returns `400 username_mismatch`. Unclaimed name returns `400 claim_first`.
+
+### Claim registry
+
+Usernames are claimed first-wins via `POST /usernames/claim`:
+
+```
+POST /usernames/claim
+{
+  "username":    "alice",
+  "dot1":        "dot1...",
+  "ed25519_pub": "<base64 32-byte ed25519 verify key>",
+  "sig":         "<base64 ed25519 sig over canonical JSON of {username, dot1, ed25519_pub, claimed_at}>",
+  "claimed_at":  1747244640.123    // unix seconds, server compares against now within ±5min
+}
+```
+
+Server validates:
+- Username regex
+- `ed25519_pub` derives the same `dot1` (binding)
+- Signature verifies over canonical-JSON of the four fields
+- `claimed_at` within ±5min of server clock
+- No prior claim exists for that username (first-wins; subsequent claims for the same name return `409 already_claimed`)
+
+On success the record is inserted into the `usernames` SQLite table with `(username PRIMARY KEY, dot1, claimed_at, ed25519_pub)`. The claim is permanent — no `release` operation exists in v1.3. (Recoverable identity is deferred to v1.4 — see roadmap.)
+
+### Resolution
+
+`GET /usernames/:name` returns `{username, dot1, ed25519_pub, claimed_at}` or 404.
+`GET /usernames/by-dot1/:dot1` returns the claimed username for a given identity, or 404.
+
+### Client behaviour
+
+Updated clients:
+- Render `@<username>` in place of the truncated `from_dot1` for any message carrying a `username` field that resolves to the claimed dot1
+- Show a "claim a username" banner on identity setup
+- Persist the claimed username in `localStorage` under key `piper-claimed-username`
+- Maintain a per-pubkey contacts registry (favourites) for friction-free contact recall
+
+### Backwards compatibility
+
+A v1.3 envelope is structurally a v1.2 envelope with an extra optional field. Servers that don't know v1.3 ignore the `username` field and store the v1.2 envelope unchanged. Older clients render the message normally with the dot1-derived display name.
+
+---
+
+## v1.4 roadmap
 
 - Forward secrecy via ephemeral X25519 keys (X3DH session setup / Double Ratchet per conversation)
-- Sealed-sender: hide `from_dot1` and sender pubkeys inside the encrypted body
+- Sealed-sender: hide `from_dot1` and sender pubkeys inside the encrypted body (currently sender identity is in clear)
 - Challenge-response dot1↔pubkey binding verification (closes the TOFU gap)
 - DiffBundle outer envelope (BLAKE3 ancestry + four-vector continuous diff)
+- Username recovery / rotation primitive (currently usernames are permanently bound to the first dot1 that claimed them)

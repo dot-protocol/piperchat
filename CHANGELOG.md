@@ -8,6 +8,38 @@ Versioning: Semantic Versioning (https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.3.0] — 2026-05-14
+
+### Added — username layer + homepage UI + favourite contacts
+
+- **First-claim-wins username registry** — `POST /usernames/claim` with ed25519-signed claim envelope binds a `[a-z0-9_-]{3,32}` username to a `dot1` identity. Permanent for v1.3; recovery / rotation deferred to v1.4.
+- **Username resolution** — `GET /usernames/:name` and `GET /usernames/by-dot1/:dot1`.
+- **Message envelope** — optional `username` field. Server verifies the username is claimed by `from_dot1` before accepting; rejects with `400 username_mismatch` or `400 claim_first`.
+- **SQLite schema** — `usernames` table `(username PK, dot1, claimed_at, ed25519_pub)` + index on `dot1`; `messages.username` column added via `addIfMissing` migration.
+- **`lib/mailbox-bridge.js`** — committed (was deployed to VPS as v1.2 transport addition but not previously tracked in git; brought into source per anti-rot Rule 1).
+- **UI: username claim banner** — appears once on identity setup; persists choice in `localStorage` under `piper-claimed-username`.
+- **UI: `@username` rendering** — replaces truncated `from_dot1` display when a message carries a verified username.
+- **UI: contacts panel + favourites** — per-pubkey local contact registry with star/unstar; remembers nicknames; surfaces favourites at top.
+- **UI: homepage chat** — chat surface on the root path (was previously gated behind `#/r/<channel>` only).
+
+### Changed
+
+- `GET /health` returns `protocol_version: "1.3"`, `version: "1.3.0"`, `protocol_versions_supported: ["1.0", "1.1", "1.2", "1.3"]`.
+- `docs/PROTOCOL.md` updated — v1.3 section authored, v1.3 roadmap renamed to v1.4 (forward secrecy, sealed-sender, challenge-response binding, DiffBundle, username recovery).
+
+### Backwards compatibility
+
+- A v1.3 envelope is structurally a v1.2 envelope with an extra optional `username` field. Servers that don't know v1.3 ignore the field. Older clients render messages with dot1-derived display names as before.
+- The username is **optional**. Senders without a claimed username send standard v1.2 envelopes; their messages render as before.
+
+### Known limitations
+
+- v1.3 usernames are **permanently bound** to the dot1 that claimed them. Lose your seed, lose your username. Recovery / rotation is v1.4 work.
+- Sender identity (`from_dot1` + sender pubkeys) remains in clear. Sealed-sender is v1.4 work.
+- No forward secrecy yet. Compromise of long-term X25519 key still decrypts message history. X3DH / Double Ratchet is v1.4 work.
+
+---
+
 ## [1.2.0] — 2026-05-12
 
 ### Added — sealed body (X25519 + AES-256-GCM)
