@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>piper-chat</title>
   <script src="vendor/tweetnacl.min.js"></script>
+  <script src="vendor/qrcode.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -565,6 +566,52 @@
 
     .modal-btns { display: flex; gap: 8px; justify-content: flex-end; }
 
+    .qr-panel {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      padding: 12px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+    }
+    .qr-panel.visible { display: flex; }
+    .qr-panel canvas {
+      background: #fff;
+      border-radius: 3px;
+      image-rendering: pixelated;
+    }
+    .qr-panel .qr-hint {
+      font-size: 10px;
+      color: var(--muted);
+    }
+
+    .scan-panel {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      padding: 10px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+    }
+    .scan-panel.visible { display: flex; }
+    .scan-panel video {
+      width: 100%;
+      max-width: 320px;
+      border-radius: 4px;
+      background: #000;
+    }
+    .scan-panel .scan-status {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .ticket-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    .ticket-row button { font-size: 11px; padding: 5px 11px; }
+
     .btn-ghost {
       background: transparent;
       color: var(--muted);
@@ -846,12 +893,26 @@
     <div>
       <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">your ticket</div>
       <div class="modal-ticket" id="my-ticket">fetching…</div>
-      <button onclick="copyTicket()" style="margin-top:8px;font-size:11px;padding:5px 11px">copy ticket</button>
+      <div class="ticket-row">
+        <button onclick="copyTicket()">copy ticket</button>
+        <button onclick="toggleQr()" id="qr-toggle-btn">show QR</button>
+      </div>
+      <div class="qr-panel" id="qr-panel">
+        <canvas id="qr-canvas" width="220" height="220" aria-label="ticket QR code"></canvas>
+        <div class="qr-hint">scan with your friend's piper-chat</div>
+      </div>
     </div>
 
     <div>
       <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">paste peer's ticket</div>
       <textarea id="peer-ticket-input" placeholder="paste iroh ticket here…"></textarea>
+      <div class="ticket-row">
+        <button onclick="toggleScan()" id="scan-toggle-btn">scan QR</button>
+      </div>
+      <div class="scan-panel" id="scan-panel">
+        <video id="scan-video" playsinline muted></video>
+        <div class="scan-status" id="scan-status">requesting camera…</div>
+      </div>
     </div>
 
     <div class="modal-btns">
@@ -1962,10 +2023,135 @@ async function openModal() {
 function closeModal() {
   $modal.classList.remove('visible');
   $peerIn.value = '';
+  hideQr();
+  stopScan();
 }
 
 function copyTicket() {
   if (myTicket) navigator.clipboard.writeText(myTicket).catch(() => {});
+}
+
+// ── QR generation (vendor/qrcode.js) ──────────────────────────────────────────
+function renderTicketQr() {
+  const canvas = document.getElementById('qr-canvas');
+  if (!canvas || !myTicket || typeof qrcode !== 'function') return false;
+  // typeNumber=0 lets the library pick the smallest type that fits.
+  const qr = qrcode(0, 'L');
+  try {
+    qr.addData(myTicket);
+    qr.make();
+  } catch (err) {
+    console.warn('QR encode failed:', err);
+    return false;
+  }
+  const count   = qr.getModuleCount();
+  const size    = canvas.width;
+  const cell    = Math.floor(size / (count + 2));
+  const offset  = Math.floor((size - cell * count) / 2);
+  const ctx     = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = '#000000';
+  for (let r = 0; r < count; r++) {
+    for (let c = 0; c < count; c++) {
+      if (qr.isDark(r, c)) ctx.fillRect(offset + c * cell, offset + r * cell, cell, cell);
+    }
+  }
+  return true;
+}
+
+function toggleQr() {
+  const panel = document.getElementById('qr-panel');
+  const btn   = document.getElementById('qr-toggle-btn');
+  if (panel.classList.contains('visible')) { hideQr(); return; }
+  if (!myTicket) { alert('no ticket available yet'); return; }
+  if (!renderTicketQr()) { alert('QR encoding failed (ticket too large?)'); return; }
+  panel.classList.add('visible');
+  btn.textContent = 'hide QR';
+}
+
+function hideQr() {
+  document.getElementById('qr-panel').classList.remove('visible');
+  document.getElementById('qr-toggle-btn').textContent = 'show QR';
+}
+
+// ── QR scanning (BarcodeDetector + getUserMedia) ──────────────────────────────
+let _scanStream   = null;
+let _scanRaf      = null;
+let _scanDetector = null;
+
+async function toggleScan() {
+  const panel = document.getElementById('scan-panel');
+  if (panel.classList.contains('visible')) { stopScan(); return; }
+  await startScan();
+}
+
+async function startScan() {
+  const panel  = document.getElementById('scan-panel');
+  const video  = document.getElementById('scan-video');
+  const status = document.getElementById('scan-status');
+  const btn    = document.getElementById('scan-toggle-btn');
+
+  if (typeof window.BarcodeDetector === 'undefined') {
+    alert('QR scanning is not supported in this browser. Paste the ticket instead.');
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert('camera access is not available in this browser.');
+    return;
+  }
+
+  panel.classList.add('visible');
+  btn.textContent = 'stop scan';
+  status.textContent = 'requesting camera…';
+
+  try {
+    _scanDetector = new BarcodeDetector({ formats: ['qr_code'] });
+    _scanStream   = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' } },
+      audio: false,
+    });
+    video.srcObject = _scanStream;
+    await video.play();
+    status.textContent = 'point camera at QR code…';
+    scanLoop();
+  } catch (err) {
+    status.textContent = 'camera error: ' + (err && err.message || err);
+    stopScan();
+  }
+}
+
+async function scanLoop() {
+  const video  = document.getElementById('scan-video');
+  const status = document.getElementById('scan-status');
+  if (!_scanDetector || !_scanStream) return;
+  try {
+    const codes = await _scanDetector.detect(video);
+    if (codes && codes.length && codes[0].rawValue) {
+      const ticket = codes[0].rawValue.trim();
+      $peerIn.value = ticket;
+      status.textContent = 'ticket captured';
+      stopScan();
+      return;
+    }
+  } catch (err) {
+    // detect() can throw transiently before the first frame is ready; keep looping
+  }
+  _scanRaf = requestAnimationFrame(scanLoop);
+}
+
+function stopScan() {
+  const panel = document.getElementById('scan-panel');
+  const video = document.getElementById('scan-video');
+  const btn   = document.getElementById('scan-toggle-btn');
+  if (_scanRaf) { cancelAnimationFrame(_scanRaf); _scanRaf = null; }
+  if (_scanStream) {
+    _scanStream.getTracks().forEach(t => t.stop());
+    _scanStream = null;
+  }
+  if (video) { video.pause(); video.srcObject = null; }
+  panel.classList.remove('visible');
+  if (btn) btn.textContent = 'scan QR';
 }
 
 async function connectPeer() {
